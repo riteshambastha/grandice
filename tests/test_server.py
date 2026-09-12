@@ -174,3 +174,32 @@ def test_a_real_task_streams_events_and_updates_state(client, session):
     state = client.get("/api/state").json()
     assert state["running"] is False
     assert state["cost"]["calls"] > 0
+
+
+# --- MCP connectors through the dashboard's lifespan (not the CLI's) ------
+
+def test_lifespan_starts_and_stops_a_configured_connector(tmp_path):
+    """The dashboard starts connectors via a FastAPI lifespan handler — a
+    different code path from the CLI's asyncio.run wrapper (see
+    server/app.py's create_app). Skipped if the optional `mcp` extras
+    aren't installed."""
+    pytest.importorskip("mcp")
+    pytest.importorskip("mcp_server_sqlite")
+
+    config = replace(
+        Config.from_env(),
+        workspace=tmp_path / "ws",
+        sandbox="sandbox-exec",
+        api_key=None,
+        base_url=None,
+        mcp_connectors=("sqlite",),
+    )
+    session = build_session(config, Gate(always_deny))
+
+    with TestClient(server_app.create_app(session=session)) as c:
+        state = c.get("/api/state").json()
+        assert state["connectors"] == ["sqlite"]
+        assert "sqlite.read_query" in state["tools"]["latent"]
+        assert not any(n.startswith("sqlite.") for n in state["tools"]["active"])
+    # __exit__ triggers the lifespan's shutdown half; a hung or raising
+    # stop_connectors would surface as this test failing to complete.

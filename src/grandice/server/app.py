@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ from pydantic import BaseModel
 from .. import loop as agent_loop
 from ..config import Config
 from ..permissions import Gate, always_deny
-from ..session import Session, build as build_session
+from ..session import Session, build as build_session, start_connectors, stop_connectors
 from .broadcast import Broadcaster
 from .serialize import event_to_dict
 
@@ -45,7 +46,18 @@ class AppState:
 
 def create_app(session: Session | None = None) -> FastAPI:
     state = AppState(session or build_session(Config.from_env(), Gate(always_deny)))
-    app = FastAPI(title="grandice")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Starting connectors needs a running event loop — build_session()
+        # above is sync and does not do this itself (see session.py).
+        await start_connectors(state.session)
+        try:
+            yield
+        finally:
+            await stop_connectors(state.session)
+
+    app = FastAPI(title="grandice", lifespan=lifespan)
     app.state.grandice = state  # exposed for tests; routes below close over `state` directly
 
     @app.get("/api/state")
@@ -138,6 +150,11 @@ def _snapshot(state: AppState) -> dict[str, Any]:
         "running": state.running,
         "plan": session.todos.items,
         "skills": [{"name": s.name, "description": s.description} for s in session.skills],
+        "connectors": [c.spec.name for c in session.connectors],
+        "tools": {
+            "active": session.registry.names(),
+            "latent": [s.name for s in session.registry.latent()],
+        },
         "cost": {
             "spent_usd": round(ledger.spent_usd, 4),
             "cap_usd": ledger.cap_usd,

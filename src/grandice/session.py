@@ -12,7 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import Config
 from .permissions import Gate
@@ -21,6 +21,9 @@ from .sandbox import Sandbox
 from .skills import SkillMeta
 from .tools import Registry
 from .tools.todo import TodoList
+
+if TYPE_CHECKING:
+    from .mcp_client import Connector
 
 
 @dataclass
@@ -32,6 +35,7 @@ class Session:
     gate: Gate
     todos: TodoList = field(default_factory=TodoList)
     skills: list[SkillMeta] = field(default_factory=list)
+    connectors: "list[Connector]" = field(default_factory=list)
 
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -67,6 +71,10 @@ class Session:
 
 
 def build(config: Config, gate: Gate) -> Session:
+    """Synchronous — constructs everything, but does not start any
+    configured MCP connectors. Those need a running event loop (the MCP SDK
+    is async throughout), so call `await start_connectors(session)` once
+    inside one before the first turn; see cli.py and server/app.py."""
     from . import sandbox as sandbox_mod
     from . import skills as skills_mod
     from .tools import build_registry
@@ -74,6 +82,15 @@ def build(config: Config, gate: Gate) -> Session:
     box = sandbox_mod.build(config.sandbox, config.workspace, image=config.sandbox_image)
     skills_dir = skills_mod.sync_into_workspace(config.workspace)
     discovered = skills_mod.discover(skills_dir)
+
+    connectors: list[Connector] = []
+    if config.mcp_connectors:
+        from . import mcp_client
+
+        connectors = [
+            mcp_client.Connector(mcp_client.spec_for(name, config.workspace, config.mcp_sqlite_path))
+            for name in config.mcp_connectors
+        ]
 
     todos = TodoList()
     return Session(
@@ -84,4 +101,23 @@ def build(config: Config, gate: Gate) -> Session:
         gate=gate,
         todos=todos,
         skills=discovered,
+        connectors=connectors,
     )
+
+
+async def start_connectors(session: Session) -> None:
+    """No-op with the default empty connector list — safe to call always."""
+    if not session.connectors:
+        return
+    from . import mcp_client
+
+    await mcp_client.start_connectors(session.connectors, session.registry)
+    session.log("connectors_started", names=[c.spec.name for c in session.connectors])
+
+
+async def stop_connectors(session: Session) -> None:
+    if not session.connectors:
+        return
+    from . import mcp_client
+
+    await mcp_client.stop_connectors(session.connectors)

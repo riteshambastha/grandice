@@ -55,27 +55,76 @@ class ToolSpec:
         return f"{self.name}\n{rendered}"
 
 
+class ToolBudgetExceeded(ValueError):
+    """Activating a tool would push the active set past Registry.MAX_ACTIVE."""
+
+
 class Registry:
     """Tool count is a quality lever. Past ~15 active tools accuracy degrades
-    sharply (§05.2), so this caps rather than trusting us to be disciplined."""
+    sharply (§05.2), so this caps rather than trusting us to be disciplined.
+
+    Built-in and skill tools are added active by default. A connector (§P3)
+    adds many tools at once — those go in latent, invisible to the model
+    until `search_tools` (tools/search.py) activates the ones it needs. This
+    is the same three-tier shape as skills.py: known-to-exist, then loaded
+    on demand, and never all in context at once.
+    """
 
     MAX_ACTIVE = 15
 
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec] = {}
+        self._active: set[str] = set()
 
-    def add(self, spec: ToolSpec) -> None:
+    def add(self, spec: ToolSpec, active: bool = True) -> None:
         self._tools[spec.name] = spec
+        if active:
+            self._active.add(spec.name)
 
     def get(self, name: str) -> ToolSpec | None:
+        """Looks up any known tool, active or latent. A model can only ever
+        emit a call for a name it was shown in `tools=` (i.e. an active one),
+        so this stays permissive rather than adding an access-control layer
+        the API itself already provides."""
         return self._tools.get(name)
 
     def names(self) -> list[str]:
-        return sorted(self._tools)
+        """Active tool names — what's actually offered to the model right
+        now. See `latent()` for what search_tools can still surface."""
+        return sorted(self._active)
+
+    def latent(self) -> list[ToolSpec]:
+        return [self._tools[n] for n in sorted(self._tools) if n not in self._active]
+
+    def search(self, query: str) -> list[ToolSpec]:
+        """Case-insensitive substring match over latent tools' name and
+        description. Deliberately simple — a connector adds a handful of
+        tools, not hundreds; this isn't a ranking problem yet."""
+        q = query.lower().strip()
+        if not q:
+            return []
+        return [s for s in self.latent() if q in s.name.lower() or q in s.description.lower()]
+
+    def activate(self, name: str) -> None:
+        """Move a latent tool into the active set the model is shown. Raises
+        ToolBudgetExceeded rather than letting `active()`'s hard cap explode
+        mid-turn — search_tools (the only caller) turns that into a normal
+        tool-result message instead of a crashed loop."""
+        if name not in self._tools:
+            raise KeyError(f"No tool named {name!r}.")
+        if name in self._active:
+            return
+        if len(self._active) + 1 > self.MAX_ACTIVE:
+            raise ToolBudgetExceeded(
+                f"Activating {name!r} would exceed the {self.MAX_ACTIVE}-tool budget."
+            )
+        self._active.add(name)
 
     def active(self) -> list[ToolSpec]:
-        tools = [self._tools[n] for n in sorted(self._tools)]
+        tools = [self._tools[n] for n in sorted(self._active)]
         if len(tools) > self.MAX_ACTIVE:
+            # A safety net, not the primary guard — activate() should always
+            # catch this first. Reachable only if something bypassed it.
             raise RuntimeError(
                 f"{len(tools)} active tools, cap is {self.MAX_ACTIVE}. Put the rest "
                 f"behind a search_tools(query) indirection (§05.2)."

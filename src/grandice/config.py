@@ -60,6 +60,12 @@ class Config:
     requests_per_minute: int = 18
     daily_request_cap: int = 50
 
+    # MCP connectors (§P3). Empty by default — `mcp` is only imported at all
+    # if this is non-empty, so a build with no connectors configured never
+    # needs the optional `mcp` extras installed.
+    mcp_connectors: tuple[str, ...] = ()
+    mcp_sqlite_path: str = "workspace.db"  # relative to the workspace
+
     @property
     def live(self) -> bool:
         """False means the stub router — the loop still runs, nothing is billed."""
@@ -82,4 +88,8 @@ class Config:
             cost_cap_usd=float(os.getenv("GRANDICE_COST_CAP_USD", "2.00")),
             requests_per_minute=int(os.getenv("GRANDICE_REQUESTS_PER_MINUTE", "18")),
             daily_request_cap=int(os.getenv("GRANDICE_DAILY_REQUEST_CAP", "50")),
+            mcp_connectors=tuple(
+                c.strip() for c in os.getenv("GRANDICE_MCP_CONNECTORS", "").split(",") if c.strip()
+            ),
+            mcp_sqlite_path=os.getenv("GRANDICE_MCP_SQLITE_PATH", "workspace.db"),
         )

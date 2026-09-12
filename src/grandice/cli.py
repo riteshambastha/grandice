@@ -17,7 +17,7 @@ from rich.panel import Panel
 from . import loop as agent_loop
 from .config import Config
 from .permissions import Gate
-from .session import Session, build as build_session
+from .session import Session, build as build_session, start_connectors, stop_connectors
 
 console = Console()
 
@@ -25,14 +25,16 @@ console = Console()
 def _banner(session: Session) -> None:
     cfg = session.config
     mode = "live" if cfg.live else "stub router (no GRANDICE_API_KEY)"
+    connectors = ", ".join(c.spec.name for c in session.connectors) or "none"
     console.print(
         Panel(
-            f"[bold]model[/]     {cfg.tiers.orchestrator}  ([dim]{mode}[/])\n"
-            f"[bold]workspace[/] {cfg.workspace}\n"
-            f"[bold]sandbox[/]   {session.sandbox.name}\n"
-            f"[bold]tools[/]     {', '.join(session.registry.names())}\n"
-            f"[bold]cost cap[/]  ${cfg.cost_cap_usd:.2f}\n"
-            f"[bold]log[/]       {session.log_path}",
+            f"[bold]model[/]      {cfg.tiers.orchestrator}  ([dim]{mode}[/])\n"
+            f"[bold]workspace[/]  {cfg.workspace}\n"
+            f"[bold]sandbox[/]    {session.sandbox.name}\n"
+            f"[bold]tools[/]      {', '.join(session.registry.names())}\n"
+            f"[bold]connectors[/] {connectors}\n"
+            f"[bold]cost cap[/]   ${cfg.cost_cap_usd:.2f}\n"
+            f"[bold]log[/]        {session.log_path}",
             title="grandice",
             border_style="blue",
         )
@@ -140,11 +142,25 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[red]{exc}[/]")
         return 2
 
-    if args.task:
-        _banner(session)
-        asyncio.run(_drive(session, args.task))
-    else:
-        asyncio.run(_repl(session))
+    async def _run() -> None:
+        try:
+            # Inside the try, not before it: if a second connector fails to
+            # start, the first one already succeeded and would otherwise
+            # leak its subprocess with no cleanup ever reached.
+            await start_connectors(session)  # a no-op with no connectors configured
+            if args.task:
+                _banner(session)
+                await _drive(session, args.task)
+            else:
+                await _repl(session)
+        finally:
+            await stop_connectors(session)
+
+    try:
+        asyncio.run(_run())
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/]")
+        return 2
     return 0
 
 

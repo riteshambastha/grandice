@@ -50,6 +50,13 @@ cd grandice
 python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 
+# Optional: the web dashboard and/or MCP connectors (fetch, sqlite — §P3).
+# Connectors run as subprocesses of the harness itself, not inside the
+# sandbox, so they need real outbound network access from this instance —
+# unlike the sandbox, this box's own egress is not restricted by anything
+# in this deploy (only inbound is locked down in step 1).
+.venv/bin/pip install -e ".[web,mcp]"
+
 # The sandbox image, built once. It bakes in openpyxl and python-pptx for the
 # xlsx/pptx skills (§07) — the sandbox has no network access, so a skill can
 # never `pip install` at runtime; anything it needs must already be in here.

@@ -13,18 +13,18 @@ section references in the code (§05.3 and so on) point back at it.
 
 ## Status
 
-The loop, seven tools, a skills loader with two document skills, the router,
-two sandbox backends, a CLI, and a live-view web dashboard — running on
-OpenRouter's free-tier models. Everything right of the router is a config
-string; everything left of it is here.
+The loop, eight core tools, a skills loader with two document skills, two MCP
+connectors, the router, two sandbox backends, a CLI, and a live-view web
+dashboard — running on OpenRouter's free-tier models. Everything right of the
+router is a config string; everything left of it is here.
 
 | Phase | | |
 |---|---|---|
 | **P0** | Loop, five tools, CLI | **done** |
 | **P1** | Todo tool, container sandbox, free-tier rate limiting, AWS deploy | **done** |
 | **P2** | Skills loader, three-tier disclosure | **done** (xlsx, pptx — docx, pdf not yet written) |
-| P3 | MCP client, two connectors, `search_tools` | next |
-| P4 | Subagents, background tasks, resumable queue | |
+| **P3** | MCP client, two connectors, `search_tools` | **done** |
+| P4 | Subagents, background tasks, resumable queue | next |
 | P5 | Client — chat, file tree, diff, task board | **partial** — see "Live view" below |
 
 ## Run it
@@ -52,7 +52,7 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 59 tests
+.venv/bin/pytest -q                        # 79 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
@@ -79,12 +79,16 @@ build step, no JS framework, nothing to compile. One process holds one
 just from a browser instead of a terminal.
 
 This is deliberately not the full P5 client the build spec describes.
-**Read-only observation plus send/cancel** is what's here; **not** built:
-in-browser approval prompts (every tool today is read/write risk, none
-outward-facing, so there's nothing to approve yet), a file diff view, or a
-task board (there's no P4 subagent/background-task system yet for one to
-show). Extending this to full P5 is mostly additive once those exist —
-see `src/grandice/server/` for the seam.
+**Read-only observation plus send/cancel** is what's here; **not** built: a
+file diff view, or a task board (there's no P4 subagent/background-task
+system yet for one to show). Extending this to full P5 is mostly additive
+once those exist — see `src/grandice/server/` for the seam.
+
+In-browser approval prompts specifically aren't built either, and now that
+the `fetch` connector exists (see "Connectors" below) that's no longer a
+theoretical gap: the dashboard's gate always denies outward actions, so
+`fetch` currently cannot be used from the web UI at all — only from the CLI,
+which prompts interactively.
 
 Binds to `127.0.0.1` by default — nothing is exposed even on an EC2 box unless
 you deliberately pass `--host`. To view a remote instance, tunnel instead of
@@ -117,6 +121,48 @@ trigger conditions (file extensions, verbs, artefact names), not an abstract
 capability summary, so a weaker orchestrator can actually match it (§07).
 Nothing else needs registering; `session.build()` discovers it automatically.
 
+## Connectors
+
+Two MCP connectors, off by default:
+
+```bash
+.venv/bin/pip install -e ".[mcp]"
+GRANDICE_MCP_CONNECTORS=fetch,sqlite .venv/bin/grandice
+```
+
+- **fetch** — fetches a URL, converts to markdown. Gated behind the
+  permission prompt (`Risk.OUTWARD`): unlike everything else in the
+  sandbox, it genuinely leaves the machine — connectors attach at the tool
+  layer, outside the network-denied sandbox, which is the only way `fetch`
+  can work at all (§07).
+- **sqlite** — read/write/create-table/list/describe against one local
+  `.db` file in the workspace. Not gated, same trust level as the built-in
+  `read`/`write` tools.
+
+Neither is active by default even when configured. Both start **latent** —
+discoverable but not shown to the model — until it calls
+`search_tools(query)`, at which point matches are activated for the rest of
+the session and become callable from the next turn. This is the same
+progressive-disclosure trick `load_skill` uses for instructions (§05.2,
+§07), applied to tools: a connector can add a handful of tools at once, and
+this is what keeps them out of context until something actually needs one.
+
+**A real compatibility note, not a hypothetical one:** `mcp` is pinned to
+the 1.x line in `pyproject.toml`, not the newest available. Verified live
+(2026-09-12): `mcp` 2.x renamed several `mcp.types` fields
+(`Tool.inputSchema` → `input_schema`, `CallToolResult.isError` → `is_error`)
+and removed `McpError` outright — and `mcp-server-fetch`, even its current
+release at the time, still imports the old name and cannot run on 2.x at
+all. Both connectors here work correctly against the pinned 1.x version;
+re-verify field names directly against whatever's actually installed before
+ever bumping it (see `mcp_client.py`'s module docstring).
+
+Adding a third connector: `mcp_client.spec_for()` needs the new server's
+launch command, and `_RISK_OVERRIDES` needs each of its tools classified —
+verify by actually starting the server and calling `list_tools()`/
+`call_tool()` against it, the same way these two were checked, rather than
+assuming risk or schema shape from documentation.
+
 ## What's here
 
 ```
@@ -129,7 +175,8 @@ src/grandice/
   context.py      compaction at 70% of the window, into fields not prose
   prompts.py      system prompt and the periodic constraint reminder
   permissions.py  per-action gate that shows the actual payload
-  tools/          read, write, edit, glob, bash, todo, load_skill
+  mcp_client.py   MCP connectors — start a server, wrap its tools as latent ToolSpecs
+  tools/          read, write, edit, glob, bash, todo, load_skill, search_tools
   server/         FastAPI + SSE live-view dashboard (app.py, broadcast.py, static/)
 skills/           xlsx, pptx — canonical source, mirrored into workspace/.skills/
 sandbox/          Dockerfile for the sandbox execution image (not the harness)
@@ -200,3 +247,13 @@ the agent to ignore its instructions. It must summarise the file, not obey it.
   browser tabs can watch it, but not run independent tasks concurrently. That
   matches the CLI's model exactly; multi-session support is a P4-and-later
   concern (subagents, a real task queue), not something this pass changes.
+- `mcp` is pinned to 1.x, not the newest release — see "Connectors" above.
+  This ecosystem is moving fast enough that a routine `pip install --upgrade`
+  could silently break both connectors; the pin is deliberate, not an
+  oversight, and bumping it needs the same live re-verification that found
+  the incompatibility in the first place.
+- Only two connectors exist (fetch, sqlite); the doc's own examples (Drive,
+  Slack, mail, Postgres) all need real credentials this build doesn't handle
+  yet. Adding one is the same shape (see "Connectors" above), but a
+  credentialed connector also needs a place to hold the credential — not
+  designed here.

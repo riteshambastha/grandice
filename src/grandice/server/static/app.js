@@ -7,6 +7,7 @@ const $log = document.getElementById("log");
 const $planList = document.getElementById("plan-list");
 const $costPanel = document.getElementById("cost-panel");
 const $skillsList = document.getElementById("skills-list");
+const $toolsPanel = document.getElementById("tools-panel");
 const $fileList = document.getElementById("file-list");
 const $breadcrumb = document.getElementById("file-breadcrumb");
 const $badgeLive = document.getElementById("badge-live");
@@ -77,6 +78,17 @@ function renderState(state) {
   $skillsList.innerHTML = state.skills.length
     ? state.skills.map(s => `<li><span class="skill-name">${escapeHtml(s.name)}</span><span class="skill-desc">${escapeHtml(s.description)}</span></li>`).join("")
     : '<li class="muted">None installed.</li>';
+
+  const connectorsLine = state.connectors.length
+    ? `Connectors: ${state.connectors.join(", ")}`
+    : "Connectors: none configured";
+  const latentLine = state.tools.latent.length
+    ? `Latent (via search_tools): ${state.tools.latent.join(", ")}`
+    : "No latent tools waiting to be activated.";
+  $toolsPanel.innerHTML = `
+    <div class="muted">${escapeHtml(connectorsLine)}</div>
+    <div style="margin-top:6px">${escapeHtml(state.tools.active.join(", "))}</div>
+    <div class="muted" style="margin-top:6px">${escapeHtml(latentLine)}</div>`;
 }
 
 function setRunning(running) {

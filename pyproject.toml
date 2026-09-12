@@ -22,6 +22,16 @@ dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "httpx>=0.27"]
 # The live-view dashboard. Optional: the CLI works fully without this group,
 # so a headless/CI install doesn't pull in a web server it never runs.
 web = ["fastapi>=0.115", "uvicorn>=0.30"]
+# MCP connectors (§P3): the official client SDK plus the two reference
+# servers this build ships (fetch, sqlite). Optional for the same reason as
+# `web` — mcp_client.py is only ever imported if GRANDICE_MCP_CONNECTORS is
+# set, so a build with none configured needs none of this installed.
+#
+# Pinned exactly, not floored — verified live (2026-09-12) that `mcp` 2.x
+# breaks both servers (mcp-server-fetch still imports the pre-2.x `McpError`
+# name outright; mcp-server-sqlite uses the pre-2.x decorator API). See
+# mcp_client.py's module docstring before ever bumping these.
+mcp = ["mcp==1.30.0", "mcp-server-fetch==2026.8.18", "mcp-server-sqlite==2025.4.25"]
 
 [project.scripts]
 grandice = "grandice.cli:main"
