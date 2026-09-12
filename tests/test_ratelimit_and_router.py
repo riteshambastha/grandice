@@ -81,3 +81,73 @@ async def test_stub_router_is_used_only_when_not_live():
     router = Router(config)
     assert isinstance(router.backends[0], StubBackend)
     assert router.rate_limiter is None  # no point pacing calls that never leave the box
+
+
+# --- OpenAICompatBackend: billing errors vs genuine rate limits ------------
+#
+# Found live against Z.ai: a 429 there means "insufficient balance or no
+# resource package", not "too many requests" — retrying can't ever fix that,
+# so it must fail fast with the provider's own message rather than burn three
+# backoff attempts and then blame a shared rate limit that was never the
+# actual cause.
+
+def _rate_limit_error(message: str, code: str = "429"):
+    import httpx
+    from openai import RateLimitError
+
+    request = httpx.Request("POST", "https://example.invalid/chat/completions")
+    response = httpx.Response(429, request=request, json={"error": {"code": code, "message": message}})
+    return RateLimitError(f"Error code: 429 - {message}", response=response, body={"code": code, "message": message})
+
+
+async def test_balance_error_fails_fast_with_the_providers_own_message(monkeypatch):
+    from grandice.router import OpenAICompatBackend
+
+    backend = OpenAICompatBackend.__new__(OpenAICompatBackend)  # skip __init__, no real client needed
+    backend.name = "test"
+
+    error = _rate_limit_error("Insufficient balance or no resource package. Please recharge.", code="1113")
+
+    async def fake_stream_once(self, *a, **kw):
+        raise error
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(OpenAICompatBackend, "_stream_once", fake_stream_once)
+
+    slept = []
+    monkeypatch.setattr("grandice.router.asyncio.sleep", lambda s: slept.append(s))
+
+    with pytest.raises(RuntimeError, match="billing problem"):
+        async for _ in backend.complete("glm-4.6", [], [], 0.2):
+            pass
+
+    assert slept == []  # no backoff attempted — retrying a billing error can't help
+
+
+async def test_a_genuine_rate_limit_still_retries_with_backoff(monkeypatch):
+    from grandice.router import OpenAICompatBackend
+
+    backend = OpenAICompatBackend.__new__(OpenAICompatBackend)
+    backend.name = "test"
+    calls = []
+
+    async def fake_stream_once(self, *a, **kw):
+        calls.append(1)
+        raise _rate_limit_error("Rate limit exceeded, please try again later.")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(OpenAICompatBackend, "_stream_once", fake_stream_once)
+
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr("grandice.router.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="Rate-limited"):
+        async for _ in backend.complete("glm-4.6", [], [], 0.2):
+            pass
+
+    assert len(calls) == OpenAICompatBackend.MAX_RATE_LIMIT_RETRIES + 1
+    assert len(slept) == OpenAICompatBackend.MAX_RATE_LIMIT_RETRIES  # it did back off, unlike the billing case

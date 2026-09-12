@@ -129,9 +129,21 @@ class OpenAICompatBackend(Backend):
                     yield item
                 return
             except RateLimitError as exc:
-                # The proactive limiter (§ratelimit) should make this rare — it
-                # catches the case of another process sharing the same key, or
-                # the provider tightening the window without notice.
+                # A 429 is not always an actual rate limit — some providers
+                # (confirmed on Z.ai) reuse the status code for "no balance
+                # or active plan", where retrying can only ever fail the same
+                # way. Fail fast and clearly for that case instead of
+                # burning three backoff attempts on something a retry can't
+                # fix.
+                if _is_balance_error(exc):
+                    raise RuntimeError(
+                        f"{model!r} rejected the request as a billing problem, not a rate "
+                        f"limit — retrying will not help. Provider said: {_error_message(exc)}"
+                    ) from exc
+
+                # The proactive limiter (§ratelimit) should make a genuine rate
+                # limit rare here — this catches another process sharing the
+                # same key, or the provider tightening the window without notice.
                 attempt += 1
                 if attempt > self.MAX_RATE_LIMIT_RETRIES:
                     raise RuntimeError(
@@ -199,6 +211,34 @@ def _retry_after_seconds(exc: Exception) -> float | None:
         return float(header) if header else None
     except ValueError:
         return None
+
+
+# Confirmed on Z.ai: HTTP 429 body {"code": "1113", "message": "Insufficient
+# balance or no resource package. Please recharge."} — a billing state, not a
+# request-rate one. Phrased generically because providers word this
+# differently; matched on the message text since a numeric code (like "1113")
+# is provider-specific and won't generalise.
+_BALANCE_ERROR_SIGNALS = (
+    "insufficient balance",
+    "insufficient quota",
+    "no resource package",
+    "recharge",
+    "exceeded your current quota",
+    "add a payment method",
+    "billing",
+)
+
+
+def _error_message(exc: Exception) -> str:
+    """The provider's own explanation, not the SDK's generic wrapper text."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict) and body.get("message"):
+        return str(body["message"])
+    return str(exc)
+
+
+def _is_balance_error(exc: Exception) -> bool:
+    return any(signal in _error_message(exc).lower() for signal in _BALANCE_ERROR_SIGNALS)
 
 
 def _parse_call(slot: dict[str, str]) -> ToolCall:
