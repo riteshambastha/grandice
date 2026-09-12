@@ -7,6 +7,8 @@ tools stop for a human. Results are truncated on the way in, not the way out.
 
 from __future__ import annotations
 
+import difflib
+
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +20,12 @@ from .session import Session
 from .tools.base import Risk, tool_error, tool_result, truncate, validate
 
 REFLECT_AFTER = 2  # consecutive failures on one tool before a forced rethink
+
+# Tools that change a file's contents on disk — the ones worth diffing.
+# Anything else (bash writing a file some other way, an MCP connector) isn't
+# covered; the diff view is best-effort, not a filesystem watcher.
+_FILE_WRITING_TOOLS = {"write", "edit"}
+DIFF_CHAR_LIMIT = 4_000  # same truncate-on-the-way-in spirit as §05.4
 
 
 @dataclass
@@ -39,13 +47,19 @@ class ToolFinished:
 
 
 @dataclass
+class FileChanged:
+    path: str
+    diff: str  # a unified diff; "(no textual difference)" if none, "(new file)" if before was absent
+
+
+@dataclass
 class Finished:
     reason: str
     steps: int
     cost_usd: float
 
 
-Event = TextDelta | ToolStarted | ToolFinished | Finished
+Event = TextDelta | ToolStarted | ToolFinished | FileChanged | Finished
 
 
 async def run_turn(
@@ -101,12 +115,17 @@ async def run_turn(
             break  # the model is done talking
 
         for call in reply.tool_calls:
+            before = _snapshot_if_relevant(session, call)
+
             yield ToolStarted(call.name, call.arguments)
             result = await execute(session, call)
             content = result["content"]
             failed = content.startswith("ERROR:") or content.startswith("STALE:")
             yield ToolFinished(call.name, not failed, _preview(content))
             session.messages.append(result)
+
+            if before is not None and not failed:
+                yield _diff_event(session, call.arguments["path"], before)
 
             if failed and session.note_failure(call.name) >= REFLECT_AFTER:
                 session.messages.append(_reflection(call.name))
@@ -162,6 +181,48 @@ async def execute(session: Session, call: ToolCall) -> dict[str, Any]:
     )
     session.log("tool_result", tool=call.name, chars=len(output), truncated=len(trimmed) < len(output))
     return tool_result(call.id, call.name, trimmed)
+
+
+def _snapshot_if_relevant(session: Session, call: ToolCall) -> str | None:
+    """The file's content before a write/edit call, so a diff can be shown
+    after (§P5). `None` means "not a file-writing call, nothing to diff" —
+    distinct from `""`, which means "the file didn't exist yet"."""
+    if call.name not in _FILE_WRITING_TOOLS:
+        return None
+    path = call.arguments.get("path")
+    if not isinstance(path, str):
+        return None
+    try:
+        target = session.sandbox.resolve(path)
+        return target.read_text() if target.exists() else ""
+    except Exception:  # noqa: BLE001 — best-effort; a real problem surfaces via the tool call itself
+        return ""
+
+
+def _diff_event(session: Session, path: str, before: str) -> FileChanged:
+    try:
+        after = session.sandbox.resolve(path).read_text()
+    except Exception:  # noqa: BLE001
+        return FileChanged(path, "(could not read the file back to diff it)")
+
+    if not before:
+        preview = after[:DIFF_CHAR_LIMIT]
+        suffix = (
+            "" if len(after) <= DIFF_CHAR_LIMIT
+            else f"\n... [{len(after) - DIFF_CHAR_LIMIT:,} more characters]"
+        )
+        return FileChanged(path, f"(new file)\n{preview}{suffix}")
+
+    diff_lines = list(difflib.unified_diff(
+        before.splitlines(keepends=True), after.splitlines(keepends=True),
+        fromfile=f"a/{path}", tofile=f"b/{path}",
+    ))
+    text = "".join(diff_lines)
+    if not text:
+        return FileChanged(path, "(no textual difference)")
+    if len(text) > DIFF_CHAR_LIMIT:
+        text = text[:DIFF_CHAR_LIMIT] + f"\n... [diff truncated, {len(text) - DIFF_CHAR_LIMIT:,} more characters]"
+    return FileChanged(path, text)
 
 
 def _reflection(tool: str) -> dict[str, Any]:

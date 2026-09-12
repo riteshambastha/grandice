@@ -1,7 +1,7 @@
 // The live-view dashboard's only script. No build step, no framework —
 // this is a dev-facing observability tool, not a production client (see
-// server/__init__.py for what's deliberately not built yet: approvals,
-// diff view, a task board).
+// server/__init__.py for what's still not built: a full file tree with
+// multi-file diffing, and a richer task board than the list here).
 
 const $log = document.getElementById("log");
 const $planList = document.getElementById("plan-list");
@@ -21,10 +21,15 @@ const $modal = document.getElementById("file-modal");
 const $modalPath = document.getElementById("modal-path");
 const $modalContent = document.getElementById("modal-content");
 const $modalClose = document.getElementById("modal-close");
+const $approvalModal = document.getElementById("approval-modal");
+const $approvalPayload = document.getElementById("approval-payload");
+const $approvalApprove = document.getElementById("approval-approve");
+const $approvalDeny = document.getElementById("approval-deny");
 
 let currentDir = ".";
 let openToolEntry = null; // the DOM node for the most recent unresolved tool_started
 let streamingText = null; // the DOM node currently accumulating text_delta chunks
+let approvalQueue = []; // {request_id, payload} — shown one at a time, oldest first
 
 // --- rendering -------------------------------------------------------
 
@@ -114,6 +119,22 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
+function renderDiff(diffText) {
+  // A real unified diff, or one of loop.py's plain-text fallbacks ("(new
+  // file)", "(no textual difference)", ...) — either way, just color the
+  // +/- lines a unified diff would have; anything else renders plain.
+  return diffText
+    .split("\n")
+    .map((line) => {
+      const escaped = escapeHtml(line);
+      if (line.startsWith("+") && !line.startsWith("+++")) return `<span class="diff-add">${escaped}</span>`;
+      if (line.startsWith("-") && !line.startsWith("---")) return `<span class="diff-remove">${escaped}</span>`;
+      if (line.startsWith("@@")) return `<span class="diff-hunk">${escaped}</span>`;
+      return escaped;
+    })
+    .join("\n");
+}
+
 function appendLogNode(node) {
   const atBottom = $log.scrollHeight - $log.scrollTop - $log.clientHeight < 40;
   $log.appendChild(node);
@@ -160,6 +181,18 @@ function handleEvent(ev) {
       preview.className = "tool-preview";
       preview.textContent = ev.preview;
       target.appendChild(preview);
+      break;
+    }
+    case "file_changed": {
+      const div = document.createElement("div");
+      div.className = "log-diff";
+      div.innerHTML = `<div class="diff-path">${escapeHtml(ev.path)}</div><pre class="diff-body">${renderDiff(ev.diff)}</pre>`;
+      appendLogNode(div);
+      break;
+    }
+    case "approval_needed": {
+      approvalQueue.push(ev);
+      if (approvalQueue.length === 1) showNextApproval();
       break;
     }
     case "finished": {
@@ -237,6 +270,37 @@ async function openFile(path) {
 
 $modalClose.onclick = () => $modal.classList.add("hidden");
 $modal.onclick = (e) => { if (e.target === $modal) $modal.classList.add("hidden"); };
+
+// --- approvals (§P5) ------------------------------------------------------
+//
+// An outward-facing tool (currently only `fetch`) blocks mid-turn waiting on
+// POST /api/approve — this modal is the only way to answer it from here.
+// Approvals queue if more than one arrives; each is shown only after the
+// previous one is resolved.
+
+function showNextApproval() {
+  const next = approvalQueue[0];
+  if (!next) {
+    $approvalModal.classList.add("hidden");
+    return;
+  }
+  $approvalPayload.textContent = next.payload;
+  $approvalModal.classList.remove("hidden");
+}
+
+async function resolveApproval(approved) {
+  const current = approvalQueue.shift();
+  if (!current) return;
+  await fetch("/api/approve", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request_id: current.request_id, approved }),
+  });
+  showNextApproval();
+}
+
+$approvalApprove.onclick = () => resolveApproval(true);
+$approvalDeny.onclick = () => resolveApproval(false);
 
 // --- task form ----------------------------------------------------------
 

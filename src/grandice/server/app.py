@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from pydantic import BaseModel
 
 from .. import loop as agent_loop
 from ..config import Config
-from ..permissions import Gate, always_deny
+from ..permissions import Gate
 from ..session import Session, build as build_session, start_connectors, stop_connectors
 from .broadcast import Broadcaster
 from .serialize import event_to_dict
@@ -28,33 +29,68 @@ from .serialize import event_to_dict
 STATIC_DIR = Path(__file__).parent / "static"
 KEEPALIVE_SECONDS = 15
 FILE_PREVIEW_LIMIT = 100_000  # characters — same truncate-on-the-way-in spirit as §05.4
+APPROVAL_TIMEOUT_SECONDS = 300  # an unanswered approval denies itself rather than hanging the turn forever
+TASK_POLL_SECONDS = 2  # how often the background-task poller checks for status changes
 
 
 class TaskIn(BaseModel):
     message: str
 
 
+class ApproveIn(BaseModel):
+    request_id: str
+    approved: bool
+
+
 class AppState:
     """Shared mutable state, held on the FastAPI app rather than as module
     globals — so create_app() can build more than one, in tests."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session | None) -> None:
         self.session = session
         self.broadcaster = Broadcaster()
         self.running = False
+        # request_id -> a Future the web_ask closure below is awaiting;
+        # POST /api/approve resolves it. Reusing Gate/Risk from permissions.py
+        # rather than a parallel approval mechanism — only the *asker* differs
+        # from the CLI's synchronous terminal prompt.
+        self.pending_approvals: dict[str, asyncio.Future] = {}
 
 
 def create_app(session: Session | None = None) -> FastAPI:
-    state = AppState(session or build_session(Config.from_env(), Gate(always_deny)))
+    state = AppState(session)
+
+    async def web_ask(payload: str) -> bool:
+        """The dashboard's Asker (§08/permissions.py): publish an
+        approval_needed event instead of blocking on terminal input, and
+        wait for POST /api/approve to resolve it. Times out to a denial
+        rather than hanging the turn forever if nobody answers."""
+        request_id = uuid.uuid4().hex[:12]
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        state.pending_approvals[request_id] = future
+        state.broadcaster.publish(
+            {"type": "approval_needed", "request_id": request_id, "payload": payload}
+        )
+        try:
+            return await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            state.pending_approvals.pop(request_id, None)
+
+    if state.session is None:
+        state.session = build_session(Config.from_env(), Gate(web_ask))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Starting connectors needs a running event loop — build_session()
         # above is sync and does not do this itself (see session.py).
         await start_connectors(state.session)
+        poller = asyncio.create_task(_poll_tasks(state))
         try:
             yield
         finally:
+            poller.cancel()
             await stop_connectors(state.session)
             state.session.tasks.close()
 
@@ -97,6 +133,16 @@ def create_app(session: Session | None = None) -> FastAPI:
         state.session.cancelled = True
         return {"status": "cancelling"}
 
+    @app.post("/api/approve")
+    async def approve(body: ApproveIn) -> dict[str, Any]:
+        future = state.pending_approvals.get(body.request_id)
+        if future is None or future.done():
+            raise HTTPException(
+                404, "No pending approval with that id — it may have already timed out or been answered."
+            )
+        future.set_result(body.approved)
+        return {"status": "ok"}
+
     @app.get("/api/events")
     async def events(request: Request) -> StreamingResponse:
         return StreamingResponse(_stream(state, request), media_type="text/event-stream")
@@ -116,6 +162,26 @@ async def _run(state: AppState, message: str) -> None:
         # Plan/cost/files may all have changed; tell the UI to refetch rather
         # than trying to diff every field into an event of its own.
         state.broadcaster.publish({"type": "state_changed"})
+
+
+async def _poll_tasks(state: AppState) -> None:
+    """Background tasks (spawn_background, §P4) run outside the SSE
+    broadcaster entirely — they're scheduled from inside a tool call, not
+    from _run above. Without this, a task's completion would only show up
+    in the dashboard on whatever unrelated state refresh happened to come
+    next. Polling is simpler than threading a callback through
+    tasks.py/subagents.py into a web-specific broadcaster, and 2 seconds is
+    frequent enough for a background task board, not a real-time feed."""
+    last: dict[str, str] = {}
+    try:
+        while True:
+            await asyncio.sleep(TASK_POLL_SECONDS)
+            current = {t.id: t.status.value for t in state.session.tasks.list()}
+            if current != last:
+                state.broadcaster.publish({"type": "state_changed"})
+                last = current
+    except asyncio.CancelledError:
+        pass
 
 
 async def _stream(state: AppState, request: Request):

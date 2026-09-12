@@ -50,6 +50,9 @@ def test_event_to_dict_covers_every_event_type():
     assert event_to_dict(agent_loop.ToolFinished("glob", True, "ok")) == {
         "type": "tool_finished", "name": "glob", "ok": True, "preview": "ok",
     }
+    assert event_to_dict(agent_loop.FileChanged("a.txt", "--- a/a.txt\n+++ b/a.txt\n")) == {
+        "type": "file_changed", "path": "a.txt", "diff": "--- a/a.txt\n+++ b/a.txt\n",
+    }
     assert event_to_dict(agent_loop.Finished("done", 3, 0.01)) == {
         "type": "finished", "reason": "done", "steps": 3, "cost_usd": 0.01,
     }
@@ -215,3 +218,106 @@ def test_lifespan_starts_and_stops_a_configured_connector(tmp_path):
         assert not any(n.startswith("sqlite.") for n in state["tools"]["active"])
     # __exit__ triggers the lifespan's shutdown half; a hung or raising
     # stop_connectors would surface as this test failing to complete.
+
+
+# --- in-browser approvals (§P5) --------------------------------------------
+
+def _build_app_with_outward_tool(tmp_path: Path, monkeypatch) -> tuple:
+    """create_app() with no session builds its own using web_ask as the
+    Asker — this is the path that actually needs testing, so unlike other
+    tests here we don't pass a pre-built session."""
+    monkeypatch.setenv("GRANDICE_WORKSPACE", str(tmp_path / "ws"))
+    monkeypatch.delenv("GRANDICE_API_KEY", raising=False)
+    monkeypatch.delenv("GRANDICE_BASE_URL", raising=False)
+
+    app = server_app.create_app()
+    state = app.state.grandice
+
+    from grandice.tools.base import Risk, ToolSpec
+
+    async def fake_send(**kwargs):
+        return "sent"
+
+    state.session.registry.add(
+        ToolSpec(
+            name="send_email",
+            description="",
+            schema={"type": "object", "properties": {"to": {"type": "string"}}, "required": ["to"]},
+            run=fake_send,
+            risk=Risk.OUTWARD,
+        )
+    )
+
+    from grandice.router import Reply, StubBackend
+    from grandice.router import ToolCall as RC
+
+    class OutwardOnceStub(StubBackend):
+        def __init__(self) -> None:
+            self._n = 0
+
+        async def complete(self, model, messages, tools, temperature):
+            self._n += 1
+            if self._n == 1:
+                yield Reply(text="", tool_calls=[RC("1", "send_email", {"to": "a@b.c"})])
+            else:
+                yield Reply(text="done")
+
+    state.session.router.backends = [OutwardOnceStub()]
+    return app, state
+
+
+def _wait_for_approval_request(client) -> str:
+    import time
+
+    for _ in range(50):
+        log = client.get("/api/log").json()
+        approvals = [e for e in log if e["type"] == "approval_needed"]
+        if approvals:
+            return approvals[0]["request_id"]
+        time.sleep(0.02)
+    raise AssertionError("no approval_needed event appeared in time")
+
+
+def _wait_until_not_running(client) -> None:
+    import time
+
+    for _ in range(50):
+        if not client.get("/api/state").json()["running"]:
+            return
+        time.sleep(0.02)
+    raise AssertionError("task never finished")
+
+
+def test_approving_lets_the_outward_tool_run(tmp_path, monkeypatch):
+    app, _ = _build_app_with_outward_tool(tmp_path, monkeypatch)
+    with TestClient(app) as c:
+        c.post("/api/task", json={"message": "send an email"})
+        request_id = _wait_for_approval_request(c)
+
+        res = c.post("/api/approve", json={"request_id": request_id, "approved": True})
+        assert res.status_code == 200
+
+        _wait_until_not_running(c)
+        log = c.get("/api/log").json()
+        finishes = [e for e in log if e["type"] == "tool_finished" and e["name"] == "send_email"]
+        assert finishes and finishes[0]["ok"] is True
+
+
+def test_denying_stops_the_outward_tool(tmp_path, monkeypatch):
+    app, _ = _build_app_with_outward_tool(tmp_path, monkeypatch)
+    with TestClient(app) as c:
+        c.post("/api/task", json={"message": "send an email"})
+        request_id = _wait_for_approval_request(c)
+
+        c.post("/api/approve", json={"request_id": request_id, "approved": False})
+
+        _wait_until_not_running(c)
+        log = c.get("/api/log").json()
+        finishes = [e for e in log if e["type"] == "tool_finished" and e["name"] == "send_email"]
+        assert finishes and finishes[0]["ok"] is False
+        assert "declined" in finishes[0]["preview"].lower()
+
+
+def test_approve_404s_on_an_unknown_request_id(client):
+    res = client.post("/api/approve", json={"request_id": "nonexistent", "approved": True})
+    assert res.status_code == 404

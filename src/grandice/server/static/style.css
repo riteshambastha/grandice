@@ -215,6 +215,26 @@ button:disabled { opacity: 0.4; cursor: default; }
   font-size: 12px; white-space: pre-wrap; color: var(--ink);
 }
 
+/* --- file diffs, in the log --- */
+.log-diff {
+  font-family: var(--mono); font-size: 12px;
+  border: 1px solid var(--rule); border-radius: 4px; overflow: hidden;
+}
+.diff-path {
+  padding: 5px 10px; background: var(--sunk); color: var(--ink-2);
+  border-bottom: 1px solid var(--rule); font-weight: 600;
+}
+.diff-body { margin: 0; padding: 8px 10px; white-space: pre-wrap; overflow-x: auto; max-height: 260px; overflow-y: auto; }
+.diff-add { color: var(--good); }
+.diff-remove { color: var(--crit); }
+.diff-hunk { color: var(--accent); }
+
+/* --- approval modal --- */
+.approval-header { color: var(--warn); font-weight: 600; border-bottom-color: var(--warn); }
+.approval-buttons { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--rule); }
+#approval-approve { background: var(--good); border-color: var(--good); color: #0e131a; font-weight: 600; }
+#approval-deny { background: var(--sunk); }
+
 @media (max-width: 860px) {
   .layout { grid-template-columns: 1fr; height: auto; }
 }

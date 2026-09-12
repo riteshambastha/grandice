@@ -26,7 +26,7 @@ string; everything left of it is here.
 | **P2** | Skills loader, three-tier disclosure | **done** (xlsx, pptx — docx, pdf not yet written) |
 | **P3** | MCP client, two connectors, `search_tools` | **done** |
 | **P4** | Subagents, background tasks, resumable queue | **done** |
-| P5 | Client — chat, file tree, diff, task board | **partial** — see "Live view" below |
+| **P5** | Client — chat, diff, approvals, live task list | **done** (per-file diff, not a full tree; a live list, not a Kanban board — see "Live view") |
 
 ## Run it
 
@@ -53,7 +53,7 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 101 tests
+.venv/bin/pytest -q                        # 112 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
@@ -64,10 +64,12 @@ container.
 ## Live view
 
 A web dashboard for actually watching the agent work, rather than reading a
-terminal log — streamed responses, a live tool-call feed, the current plan,
-cost and rate-limit meters, the skills catalog, and a workspace file browser
-with a preview pane. Send a task or cancel one from the page; any number of
-browser tabs can watch the same session at once.
+terminal log — streamed responses, a live tool-call feed with real diffs on
+every file change, in-browser approval prompts for outward-facing tools, the
+current plan, a live-updating background-task list, cost and rate-limit
+meters, the skills catalog, and a workspace file browser with a preview pane.
+Send a task or cancel one from the page; any number of browser tabs can
+watch the same session at once.
 
 ```bash
 .venv/bin/pip install -e ".[web]"
@@ -79,17 +81,29 @@ build step, no JS framework, nothing to compile. One process holds one
 `Session`; the dashboard observes and drives that same session the CLI would,
 just from a browser instead of a terminal.
 
-This is deliberately not the full P5 client the build spec describes.
-**Read-only observation plus send/cancel** is what's here; **not** built: a
-file diff view, or a task board (there's no P4 subagent/background-task
-system yet for one to show). Extending this to full P5 is mostly additive
-once those exist — see `src/grandice/server/` for the seam.
+**Diffs.** Every successful `write`/`edit` call produces a real unified diff
+(`difflib`, computed in `loop.py` around the tool call — before/after content,
+not a guess), rendered as its own colored block in the log. A brand-new file
+shows its content directly instead of a diff against nothing.
 
-In-browser approval prompts specifically aren't built either, and now that
-the `fetch` connector exists (see "Connectors" below) that's no longer a
-theoretical gap: the dashboard's gate always denies outward actions, so
-`fetch` currently cannot be used from the web UI at all — only from the CLI,
-which prompts interactively.
+**Approvals.** `fetch` (§P3's outward-facing connector tool) now works from
+the dashboard: the turn pauses, an approval modal shows the actual payload —
+the real URL, not "the agent wants to fetch something" — and Approve/Deny
+resolves it. This reuses the exact same `Gate`/`Risk.OUTWARD` mechanism the
+CLI's terminal prompt already used (see `permissions.py`); only the *asker*
+differs — an SSE event plus a pending `Future` that `POST /api/approve`
+resolves, instead of blocking on `input()`. An unanswered approval denies
+itself after 5 minutes rather than hanging the turn forever.
+
+**Background tasks, live.** `spawn_background` (§P4) runs outside the SSE
+broadcaster entirely — a lightweight poller (every 2s) is what makes a task's
+completion show up without a manual refresh.
+
+This is not the full P5 client the build spec describes to the letter — no
+multi-file tree-wide diff view (one file's diff at a time, as it happens, is
+what's here), and the task list is a live list, not a Kanban-style board.
+Both are extensions of what already exists rather than new architecture; see
+`src/grandice/server/` for the seam.
 
 Binds to `127.0.0.1` by default — nothing is exposed even on an EC2 box unless
 you deliberately pass `--host`. To view a remote instance, tunnel instead of
@@ -304,11 +318,20 @@ the agent to ignore its instructions. It must summarise the file, not obey it.
   subagents. Deliberate scope for this pass, not a technical ceiling; lifting
   it is mostly relaxing `_RECURSIVE_TOOL_NAMES` in `subagents.py`, but that
   also reopens the runaway-recursive-cost question this restriction sidesteps.
-- A background task's completion isn't pushed live to the dashboard the way
-  the main task's events are — `spawn_background` runs outside the SSE
-  broadcaster entirely. It shows up in the "Background tasks" panel on the
-  next state refresh (after the current turn finishes, or a page reload),
-  not the instant it actually finishes. Real-time push for this is P5's
-  fuller task board, not built here.
+- A background task's completion reaches the dashboard through a 2-second
+  poller (`server/app.py`'s `_poll_tasks`), not an instant push — `spawn_
+  background` runs outside the SSE broadcaster entirely, since tools stay
+  unaware of the web layer on purpose. Close enough to live for a task board;
+  not the same guarantee the main task's own events have.
 - `.grandice/tasks.db` has no pruning — it grows forever. Fine at the scale
   this has been used at; revisit if it matters.
+- The diff view covers `write`/`edit` only — a file changed some other way
+  (bash redirecting output, an MCP connector) produces no diff. Best-effort,
+  not a filesystem watcher.
+- An unanswered approval denies itself after 5 minutes (`APPROVAL_TIMEOUT_
+  SECONDS`) rather than hanging the turn forever — reasonable for a human
+  who stepped away, but it does mean walking away from the dashboard mid-
+  approval silently declines the action rather than leaving it pending.
+- The diff view and approval modal are single-file/single-request — no
+  tree-wide "review everything this turn changed" view, and approvals queue
+  one at a time rather than showing several at once.
