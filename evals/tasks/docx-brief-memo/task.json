@@ -1,0 +1,4 @@
+{
+  "prompt": "Read notes.txt and create memo.docx: a heading 'Q3 Planning Memo', then one bullet point per numbered item in the notes.",
+  "timeout": 300
+}

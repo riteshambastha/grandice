@@ -74,7 +74,7 @@ async def test_every_phase_p0_through_p4_in_one_session(session):
     assert session.router.rate_limiter is None  # stub mode: nothing to pace
 
     # --- P2: skills discovered and loadable --------------------------------
-    assert {s.name for s in session.skills} == {"xlsx", "pptx"}
+    assert {s.name for s in session.skills} == {"xlsx", "pptx", "docx", "pdf"}
     r = await agent_loop.execute(session, ToolCall("1", "load_skill", {"name": "xlsx"}))
     assert "openpyxl" in r["content"]
 

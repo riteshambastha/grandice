@@ -13,4 +13,6 @@ FROM python:3.12-slim
 
 RUN pip install --no-cache-dir \
         openpyxl==3.1.* \
-        python-pptx==1.0.*
+        python-pptx==1.0.* \
+        python-docx==1.2.* \
+        pypdf==6.*

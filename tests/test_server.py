@@ -99,7 +99,7 @@ def test_state_reports_model_sandbox_and_zero_cost(client, session):
     assert body["running"] is False
     assert body["cost"]["spent_usd"] == 0.0
     assert body["rate_limit"] is None  # stub mode: nothing to pace
-    assert {s["name"] for s in body["skills"]} == {"xlsx", "pptx"}
+    assert {s["name"] for s in body["skills"]} == {"xlsx", "pptx", "docx", "pdf"}
     assert body["tasks"] == []
 
 

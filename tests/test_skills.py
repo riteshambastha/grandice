@@ -153,7 +153,7 @@ def test_tool_count_stays_well_under_the_active_cap(session):
 
 # --- the real skills shipped in the repo ---------------------------------
 
-@pytest.mark.parametrize("name", ["xlsx", "pptx"])
+@pytest.mark.parametrize("name", ["xlsx", "pptx", "docx", "pdf"])
 def test_shipped_skill_frontmatter_is_well_formed(name):
     found = [s for s in skills_mod.discover(skills_mod.REPO_SKILLS_DIR) if s.name == name]
     assert len(found) == 1, f"{name} skill not discovered from {skills_mod.REPO_SKILLS_DIR}"
@@ -167,3 +167,5 @@ def test_shipped_skills_catalog_names_the_real_trigger_conditions():
     text = skills_mod.catalog(found)
     assert ".xlsx" in text
     assert ".pptx" in text
+    assert ".docx" in text
+    assert ".pdf" in text

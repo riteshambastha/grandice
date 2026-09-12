@@ -57,9 +57,10 @@ python3.12 -m venv .venv
 # in this deploy (only inbound is locked down in step 1).
 .venv/bin/pip install -e ".[web,mcp]"
 
-# The sandbox image, built once. It bakes in openpyxl and python-pptx for the
-# xlsx/pptx skills (§07) — the sandbox has no network access, so a skill can
-# never `pip install` at runtime; anything it needs must already be in here.
+# The sandbox image, built once. It bakes in the four document skills'
+# libraries (openpyxl, python-pptx, python-docx, pypdf — §07) — the sandbox
+# has no network access, so a skill can never `pip install` at runtime;
+# anything it needs must already be in here.
 docker build -t grandice-sandbox:py3.12 sandbox/
 ```
 
@@ -108,7 +109,7 @@ async def main():
         ("write inside",  "echo hello > ok.txt && cat ok.txt"),
         ("no network",    "curl -s -m 3 https://example.com -o /dev/null && echo REACHED || echo blocked"),
         ("wall-clock cap","sleep 30"),
-        ("skill deps",    "python3 -c 'import openpyxl, pptx; print(openpyxl.__version__, pptx.__version__)'"),
+        ("skill deps",    "python3 -c 'import openpyxl, pptx, docx, pypdf; print(openpyxl.__version__, pptx.__version__, pypdf.__version__)'"),
     ]:
         r = await box.run(cmd, timeout=5)
         print(f"{label:16} exit={r.exit_code:<4} {r.render()[:80]!r}")
@@ -120,10 +121,9 @@ rm -f workspace/ok.txt
 
 Expect: the first prints `hello`, the second prints `blocked` (no `REACHED`),
 the third exits 124 with `[killed: wall-clock cap reached]`, and the fourth
-prints both library versions — confirming the xlsx/pptx skills will actually
-work inside this sandbox. If any of those
-don't hold, do not proceed to running real tasks — file it before trusting the
-sandbox.
+prints the library versions — confirming all four document skills will
+actually work inside this sandbox. If any of those don't hold, do not
+proceed to running real tasks — file it before trusting the sandbox.
 
 ## 6. Run it
 

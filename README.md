@@ -13,7 +13,7 @@ section references in the code (§05.3 and so on) point back at it.
 
 ## Status
 
-The loop, twelve core tools, a skills loader with two document skills, two MCP
+The loop, twelve core tools, a skills loader with four document skills, two MCP
 connectors, subagents with a persisted background-task queue, the router, two
 sandbox backends, a CLI, and a live-view web dashboard — running on
 OpenRouter's free-tier models. Everything right of the router is a config
@@ -23,7 +23,7 @@ string; everything left of it is here.
 |---|---|---|
 | **P0** | Loop, five tools, CLI | **done** |
 | **P1** | Todo tool, container sandbox, free-tier rate limiting, AWS deploy | **done** |
-| **P2** | Skills loader, three-tier disclosure | **done** (xlsx, pptx — docx, pdf not yet written) |
+| **P2** | Skills loader, three-tier disclosure | **done** (xlsx, pptx, docx, pdf) |
 | **P3** | MCP client, two connectors, `search_tools` | **done** |
 | **P4** | Subagents, background tasks, resumable queue | **done** |
 | **P5** | Client — chat, diff, approvals, live task list | **done** (per-file diff, not a full tree; a live list, not a Kanban board — see "Live view") |
@@ -53,7 +53,7 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 112 tests
+.venv/bin/pytest -q                        # 114 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
@@ -112,14 +112,22 @@ opening a port: `ssh -L 8000:localhost:8000 <host>`, then browse
 
 ## Skills
 
-Two document skills ship: **xlsx** (openpyxl) and **pptx** (python-pptx).
-Each is a `skills/<name>/SKILL.md` — frontmatter the model always sees (Tier
-1, a couple dozen tokens), a body it pulls in on demand via `load_skill`
-(Tier 2), and a helper script it runs but never reads into context (Tier 3,
-`scripts/*_inspect.py` — summarises a workbook or deck without dumping it
-whole). See `skills/xlsx/SKILL.md` and `skills/pptx/SKILL.md` for the actual
-failure modes each one guards against (the `data_only` trap, merged-cell
-writes, placeholder indices that don't exist on a given layout, and so on).
+Four document skills ship: **xlsx** (openpyxl), **pptx** (python-pptx),
+**docx** (python-docx), **pdf** (pypdf). Each is a `skills/<name>/SKILL.md` —
+frontmatter the model always sees (Tier 1, a couple dozen tokens), a body it
+pulls in on demand via `load_skill` (Tier 2), and a helper script it runs but
+never reads into context (Tier 3, `scripts/*_inspect.py` — summarises a
+file without dumping it whole). See each skill's own `SKILL.md` for the
+failure modes it guards against, each one verified against the real library
+before being written down, not assumed: the `data_only` formula-caching trap
+and merged-cell writes (xlsx); placeholder indices that don't exist on a
+given slide layout (pptx); `doc.paragraphs` silently excluding table and
+header/footer text, and reading order being lost between paragraphs and
+tables unless you walk the body XML directly (docx, both confirmed by
+actually building a document and reading it back); `PdfMerger` not existing
+in the currently pinned pypdf version — merging is a `PdfWriter.append()`
+call now — and no OCR, ever, so a scanned page returns near-empty text with
+no error at all rather than failing loudly (pdf).
 
 Under `sandbox-exec` these libraries come from the harness's own venv — the
 sandboxed exec's PATH is pointed at it (see `sandbox._clean_env`). Under the
@@ -130,7 +138,7 @@ sandbox has no network access to install anything at runtime:
 docker build -t grandice-sandbox:py3.12 sandbox/
 ```
 
-Adding a third skill: create `skills/<name>/SKILL.md` with a `name` and
+Adding a fifth skill: create `skills/<name>/SKILL.md` with a `name` and
 `description` in its frontmatter — write the description around concrete
 trigger conditions (file extensions, verbs, artefact names), not an abstract
 capability summary, so a weaker orchestrator can actually match it (§07).
@@ -289,8 +297,9 @@ the agent to ignore its instructions. It must summarise the file, not obey it.
 - Docker sandbox isolation flags are unit-tested against the constructed
   command, not a live daemon (none runs on the macOS dev machine) — the first
   real check is the smoke test in `DEPLOY_AWS.md` §5, on the actual EC2 host.
-- Only xlsx and pptx are written; docx and pdf are in the original plan but
-  not built. Adding one is the same shape (see "Skills" above).
+- The pdf skill cannot author new richly-formatted content, and does no
+  OCR — see the skill's own opening section, stated up front rather than
+  discovered mid-task. Both are pypdf's actual limits, not an oversight.
 - `sandbox/Dockerfile` needs a manual rebuild after a skill gains a new
   dependency — there's no registry, so this only happens on whatever host
   actually runs the docker sandbox backend.

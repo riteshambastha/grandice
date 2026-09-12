@@ -1,0 +1,4 @@
+{
+  "prompt": "Merge cover.pdf and body.pdf together into combined.pdf, in that order, then write the extracted text of combined.pdf's first page to first_page.txt.",
+  "timeout": 300
+}
