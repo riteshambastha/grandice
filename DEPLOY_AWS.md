@@ -123,13 +123,34 @@ sandbox.
 ```bash
 .venv/bin/grandice "list the workspace"          # one task
 .venv/bin/grandice                               # REPL
-.venv/bin/pytest -q                              # 28 tests, same suite as local dev
+.venv/bin/pytest -q                              # 59 tests, same suite as local dev
 ```
+
+Or the web dashboard instead of the terminal:
+
+```bash
+.venv/bin/pip install -e ".[web]"
+.venv/bin/grandice-web            # binds 127.0.0.1:8000 by default — not reachable remotely yet
+```
+
+It binds to localhost only and has no authentication, on purpose — the
+security group in step 1 opens no inbound port for it. View it by tunneling
+rather than exposing it:
+
+```bash
+# from your own machine, not the EC2 host:
+ssh -L 8000:localhost:8000 ec2-user@<instance-ip>
+```
+
+Then browse `http://127.0.0.1:8000` locally. Do not point `--host` at
+`0.0.0.0` or open port 8000 in the security group without adding real
+authentication in front of it first — nothing in this deployment does that
+today.
 
 ## 7. Keep it running (systemd)
 
-Only needed for the REPL/long-lived case — a one-shot task from a script or
-cron doesn't need this.
+Only needed for the REPL/dashboard's long-lived case — a one-shot task from a
+script or cron doesn't need this. Pick whichever entry point you're using.
 
 ```ini
 # /etc/systemd/system/grandice.service
@@ -149,6 +170,12 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
+```
+
+For the dashboard instead, change only `ExecStart`:
+
+```ini
+ExecStart=/home/ec2-user/grandice/.venv/bin/grandice-web
 ```
 
 ```bash

@@ -14,9 +14,9 @@ section references in the code (§05.3 and so on) point back at it.
 ## Status
 
 The loop, seven tools, a skills loader with two document skills, the router,
-two sandbox backends and a CLI — running on OpenRouter's free-tier models.
-Everything right of the router is a config string; everything left of it is
-here.
+two sandbox backends, a CLI, and a live-view web dashboard — running on
+OpenRouter's free-tier models. Everything right of the router is a config
+string; everything left of it is here.
 
 | Phase | | |
 |---|---|---|
@@ -25,7 +25,7 @@ here.
 | **P2** | Skills loader, three-tier disclosure | **done** (xlsx, pptx — docx, pdf not yet written) |
 | P3 | MCP client, two connectors, `search_tools` | next |
 | P4 | Subagents, background tasks, resumable queue | |
-| P5 | Client — chat, file tree, diff, task board | |
+| P5 | Client — chat, file tree, diff, task board | **partial** — see "Live view" below |
 
 ## Run it
 
@@ -52,13 +52,44 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 45 tests
+.venv/bin/pytest -q                        # 59 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
 **Deploying to AWS?** See [DEPLOY_AWS.md](DEPLOY_AWS.md) — EC2 sizing, Docker
 setup, and why the harness runs directly on the host rather than in its own
 container.
+
+## Live view
+
+A web dashboard for actually watching the agent work, rather than reading a
+terminal log — streamed responses, a live tool-call feed, the current plan,
+cost and rate-limit meters, the skills catalog, and a workspace file browser
+with a preview pane. Send a task or cancel one from the page; any number of
+browser tabs can watch the same session at once.
+
+```bash
+.venv/bin/pip install -e ".[web]"
+.venv/bin/grandice-web            # http://127.0.0.1:8000
+```
+
+It's a FastAPI app streaming Server-Sent Events to a single static page — no
+build step, no JS framework, nothing to compile. One process holds one
+`Session`; the dashboard observes and drives that same session the CLI would,
+just from a browser instead of a terminal.
+
+This is deliberately not the full P5 client the build spec describes.
+**Read-only observation plus send/cancel** is what's here; **not** built:
+in-browser approval prompts (every tool today is read/write risk, none
+outward-facing, so there's nothing to approve yet), a file diff view, or a
+task board (there's no P4 subagent/background-task system yet for one to
+show). Extending this to full P5 is mostly additive once those exist —
+see `src/grandice/server/` for the seam.
+
+Binds to `127.0.0.1` by default — nothing is exposed even on an EC2 box unless
+you deliberately pass `--host`. To view a remote instance, tunnel instead of
+opening a port: `ssh -L 8000:localhost:8000 <host>`, then browse
+`http://127.0.0.1:8000` locally.
 
 ## Skills
 
@@ -99,6 +130,7 @@ src/grandice/
   prompts.py      system prompt and the periodic constraint reminder
   permissions.py  per-action gate that shows the actual payload
   tools/          read, write, edit, glob, bash, todo, load_skill
+  server/         FastAPI + SSE live-view dashboard (app.py, broadcast.py, static/)
 skills/           xlsx, pptx — canonical source, mirrored into workspace/.skills/
 sandbox/          Dockerfile for the sandbox execution image (not the harness)
 evals/            pass/fail tasks with mechanical checks — run on every model swap
@@ -161,3 +193,10 @@ the agent to ignore its instructions. It must summarise the file, not obey it.
 - `sandbox/Dockerfile` needs a manual rebuild after a skill gains a new
   dependency — there's no registry, so this only happens on whatever host
   actually runs the docker sandbox backend.
+- The dashboard has **no authentication** — its only protection is binding to
+  `127.0.0.1` by default. Do not point `--host` at a public interface without
+  adding auth in front of it first; use an SSH tunnel instead.
+- The dashboard holds one `Session` and runs one task at a time — multiple
+  browser tabs can watch it, but not run independent tasks concurrently. That
+  matches the CLI's model exactly; multi-session support is a P4-and-later
+  concern (subagents, a real task queue), not something this pass changes.

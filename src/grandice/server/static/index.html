@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>grandice</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-name">grandice</span>
+      <span id="badge-live" class="badge">…</span>
+    </div>
+    <div id="badge-row" class="badge-row"></div>
+  </header>
+
+  <main class="layout">
+    <section class="panel log-panel">
+      <h2>Session</h2>
+      <div id="log" class="log"></div>
+      <form id="task-form" class="task-form">
+        <textarea id="task-input" placeholder="Give it a task…" rows="2"></textarea>
+        <div class="task-buttons">
+          <button type="submit" id="send-btn">Send</button>
+          <button type="button" id="cancel-btn" disabled>Cancel</button>
+        </div>
+      </form>
+    </section>
+
+    <aside class="sidebar">
+      <section class="panel">
+        <h2>Plan</h2>
+        <ul id="plan-list" class="plan-list"><li class="muted">No plan yet.</li></ul>
+      </section>
+
+      <section class="panel">
+        <h2>Cost &amp; rate limit</h2>
+        <div id="cost-panel"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Skills</h2>
+        <ul id="skills-list" class="skills-list"></ul>
+      </section>
+
+      <section class="panel files-panel">
+        <h2>Workspace</h2>
+        <div id="file-breadcrumb" class="breadcrumb"></div>
+        <ul id="file-list" class="file-list"></ul>
+      </section>
+    </aside>
+  </main>
+
+  <div id="file-modal" class="modal hidden">
+    <div class="modal-inner">
+      <div class="modal-header">
+        <span id="modal-path"></span>
+        <button id="modal-close">×</button>
+      </div>
+      <pre id="modal-content" class="modal-content"></pre>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
