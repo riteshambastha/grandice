@@ -38,7 +38,7 @@ class Config:
 
     workspace: Path = Path("workspace")
     sandbox: str = "sandbox-exec"
-    sandbox_image: str = "python:3.12-slim"  # only used by the docker backend
+    sandbox_image: str = "grandice-sandbox:py3.12"  # only used by the docker backend; build via sandbox/Dockerfile
 
     # Loop limits (§04).
     max_steps: int = 120
@@ -78,7 +78,7 @@ class Config:
             ),
             workspace=Path(os.getenv("GRANDICE_WORKSPACE", "workspace")).resolve(),
             sandbox=os.getenv("GRANDICE_SANDBOX", default_sandbox),
-            sandbox_image=os.getenv("GRANDICE_SANDBOX_IMAGE", "python:3.12-slim"),
+            sandbox_image=os.getenv("GRANDICE_SANDBOX_IMAGE", "grandice-sandbox:py3.12"),
             cost_cap_usd=float(os.getenv("GRANDICE_COST_CAP_USD", "2.00")),
             requests_per_minute=int(os.getenv("GRANDICE_REQUESTS_PER_MINUTE", "18")),
             daily_request_cap=int(os.getenv("GRANDICE_DAILY_REQUEST_CAP", "50")),

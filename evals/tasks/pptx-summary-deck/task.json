@@ -1,0 +1,4 @@
+{
+  "prompt": "Read notes.txt and create brief.pptx: a title slide titled 'Q3 Planning Brief', then one content slide per numbered point in the notes, each with that point's heading as the slide title.",
+  "timeout": 300
+}

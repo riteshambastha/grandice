@@ -143,9 +143,19 @@ class SandboxExec(Sandbox):
 
 def _clean_env(cwd: Path) -> dict[str, str]:
     """A deliberately small environment. The agent inherits no API keys, no
-    shell config and no credentials that happen to live in yours."""
+    shell config and no credentials that happen to live in yours.
+
+    One addition: the harness's own interpreter directory goes first on PATH,
+    so a bare `python3` inside a sandbox-exec/none exec resolves to the venv
+    grandice itself runs under — the one with openpyxl/python-pptx installed
+    for the document skills (§07) — rather than the system Python, which has
+    neither. This only matters for sandbox-exec and none: DockerSandbox sets
+    its own PATH pointing at whatever is baked into the sandbox image, since
+    a host env var cannot reach inside a container anyway.
+    """
+    python_bin = str(Path(sys.executable).parent)
     return {
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "PATH": f"{python_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": str(cwd),
         "PWD": str(cwd),
         "TMPDIR": tempfile.gettempdir(),

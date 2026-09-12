@@ -1,0 +1,4 @@
+{
+  "prompt": "Read sales.csv. Create report.xlsx with a 'Summary' sheet listing each product, its revenue (units * unit_price), and a bold header row. Sort rows by revenue, highest first.",
+  "timeout": 300
+}

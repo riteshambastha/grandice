@@ -9,6 +9,12 @@ dependencies = [
     "pydantic>=2.7",
     "rich>=13.7",
     "python-dotenv>=1.0",
+    # For the xlsx/pptx skills (§07). Under sandbox-exec the sandboxed exec
+    # reuses this same venv (see sandbox._clean_env), so these must be
+    # runtime deps, not dev-only — the docker sandbox instead bakes them
+    # into its own image (see sandbox/Dockerfile).
+    "openpyxl>=3.1",
+    "python-pptx>=1.0",
 ]
 
 [project.optional-dependencies]

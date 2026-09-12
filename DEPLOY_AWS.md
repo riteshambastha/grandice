@@ -24,8 +24,8 @@ sandbox container.
 - **Instance type**: `t3.small` is enough (2 vCPU, 2 GB) for the harness
   itself — it is not doing inference locally. Go to `t3.medium` if you plan to
   run several sessions at once.
-- **Storage**: 20 GB gp3 is comfortable headroom over the ~1.5 GB the base
-  Docker image (`python:3.12-slim`) and the venv take.
+- **Storage**: 20 GB gp3 is comfortable headroom over the ~1.6 GB the sandbox
+  image (`python:3.12-slim` plus openpyxl/python-pptx) and the venv take.
 - **Security group**: no inbound ports needed for the CLI. Allow SSH (22)
   from your IP only. Nothing needs to be public — this is a client, not a
   server, at P0/P1.
@@ -49,7 +49,11 @@ git clone https://github.com/riteshambastha/grandice.git
 cd grandice
 python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-docker pull python:3.12-slim   # the default sandbox image — pull once up front
+
+# The sandbox image, built once. It bakes in openpyxl and python-pptx for the
+# xlsx/pptx skills (§07) — the sandbox has no network access, so a skill can
+# never `pip install` at runtime; anything it needs must already be in here.
+docker build -t grandice-sandbox:py3.12 sandbox/
 ```
 
 ## 4. Configure
@@ -92,11 +96,12 @@ from pathlib import Path
 from grandice import sandbox as sb
 
 async def main():
-    box = sb.build("docker", Path("workspace"))
+    box = sb.build("docker", Path("workspace"), image="grandice-sandbox:py3.12")
     for label, cmd in [
         ("write inside",  "echo hello > ok.txt && cat ok.txt"),
         ("no network",    "curl -s -m 3 https://example.com -o /dev/null && echo REACHED || echo blocked"),
         ("wall-clock cap","sleep 30"),
+        ("skill deps",    "python3 -c 'import openpyxl, pptx; print(openpyxl.__version__, pptx.__version__)'"),
     ]:
         r = await box.run(cmd, timeout=5)
         print(f"{label:16} exit={r.exit_code:<4} {r.render()[:80]!r}")
@@ -107,7 +112,9 @@ rm -f workspace/ok.txt
 ```
 
 Expect: the first prints `hello`, the second prints `blocked` (no `REACHED`),
-the third exits 124 with `[killed: wall-clock cap reached]`. If any of those
+the third exits 124 with `[killed: wall-clock cap reached]`, and the fourth
+prints both library versions — confirming the xlsx/pptx skills will actually
+work inside this sandbox. If any of those
 don't hold, do not proceed to running real tasks — file it before trusting the
 sandbox.
 
@@ -166,3 +173,8 @@ journalctl -u grandice -f
 - **The workspace persists on the instance's EBS volume**, not S3. Fine for
   one user; revisit if the workspace needs to survive an instance
   replacement or be shared.
+- **A new skill's dependencies mean rebuilding the sandbox image**, not just
+  editing a SKILL.md. `sandbox/Dockerfile` is the only place a skill's
+  Python library can be added — the network-less sandbox can never install
+  one at runtime. Re-run `docker build -t grandice-sandbox:py3.12 sandbox/`
+  after adding one, on this host, since the image isn't pushed anywhere.

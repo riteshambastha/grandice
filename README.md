@@ -13,16 +13,17 @@ section references in the code (§05.3 and so on) point back at it.
 
 ## Status
 
-The loop, six tools, the router, two sandbox backends and a CLI — running on
-OpenRouter's free-tier models. Everything right of the router is a config
-string; everything left of it is here.
+The loop, seven tools, a skills loader with two document skills, the router,
+two sandbox backends and a CLI — running on OpenRouter's free-tier models.
+Everything right of the router is a config string; everything left of it is
+here.
 
 | Phase | | |
 |---|---|---|
 | **P0** | Loop, five tools, CLI | **done** |
-| **P1** | Todo tool, container sandbox, free-tier rate limiting, AWS deploy | **done** (documents still open) |
-| P2 | Skills loader, three-tier disclosure | next |
-| P3 | MCP client, two connectors, `search_tools` | |
+| **P1** | Todo tool, container sandbox, free-tier rate limiting, AWS deploy | **done** |
+| **P2** | Skills loader, three-tier disclosure | **done** (xlsx, pptx — docx, pdf not yet written) |
+| P3 | MCP client, two connectors, `search_tools` | next |
 | P4 | Subagents, background tasks, resumable queue | |
 | P5 | Client — chat, file tree, diff, task board | |
 
@@ -51,13 +52,39 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 28 tests
+.venv/bin/pytest -q                        # 45 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
 **Deploying to AWS?** See [DEPLOY_AWS.md](DEPLOY_AWS.md) — EC2 sizing, Docker
 setup, and why the harness runs directly on the host rather than in its own
 container.
+
+## Skills
+
+Two document skills ship: **xlsx** (openpyxl) and **pptx** (python-pptx).
+Each is a `skills/<name>/SKILL.md` — frontmatter the model always sees (Tier
+1, a couple dozen tokens), a body it pulls in on demand via `load_skill`
+(Tier 2), and a helper script it runs but never reads into context (Tier 3,
+`scripts/*_inspect.py` — summarises a workbook or deck without dumping it
+whole). See `skills/xlsx/SKILL.md` and `skills/pptx/SKILL.md` for the actual
+failure modes each one guards against (the `data_only` trap, merged-cell
+writes, placeholder indices that don't exist on a given layout, and so on).
+
+Under `sandbox-exec` these libraries come from the harness's own venv — the
+sandboxed exec's PATH is pointed at it (see `sandbox._clean_env`). Under the
+Docker backend they're baked into `sandbox/Dockerfile` instead, since the
+sandbox has no network access to install anything at runtime:
+
+```bash
+docker build -t grandice-sandbox:py3.12 sandbox/
+```
+
+Adding a third skill: create `skills/<name>/SKILL.md` with a `name` and
+`description` in its frontmatter — write the description around concrete
+trigger conditions (file extensions, verbs, artefact names), not an abstract
+capability summary, so a weaker orchestrator can actually match it (§07).
+Nothing else needs registering; `session.build()` discovers it automatically.
 
 ## What's here
 
@@ -67,10 +94,13 @@ src/grandice/
   router.py       one interface per provider, cost ledger, failover
   ratelimit.py    free-tier pacing: per-minute window + a persisted daily cap
   sandbox.py      sandbox-exec (macOS) or docker (Linux/EC2) — same interface
+  skills.py       three-tier skill discovery + workspace sync (§07)
   context.py      compaction at 70% of the window, into fields not prose
   prompts.py      system prompt and the periodic constraint reminder
   permissions.py  per-action gate that shows the actual payload
-  tools/          read, write, edit, glob, bash, todo
+  tools/          read, write, edit, glob, bash, todo, load_skill
+skills/           xlsx, pptx — canonical source, mirrored into workspace/.skills/
+sandbox/          Dockerfile for the sandbox execution image (not the harness)
 evals/            pass/fail tasks with mechanical checks — run on every model swap
 ```
 
@@ -126,3 +156,8 @@ the agent to ignore its instructions. It must summarise the file, not obey it.
 - Docker sandbox isolation flags are unit-tested against the constructed
   command, not a live daemon (none runs on the macOS dev machine) — the first
   real check is the smoke test in `DEPLOY_AWS.md` §5, on the actual EC2 host.
+- Only xlsx and pptx are written; docx and pdf are in the original plan but
+  not built. Adding one is the same shape (see "Skills" above).
+- `sandbox/Dockerfile` needs a manual rebuild after a skill gains a new
+  dependency — there's no registry, so this only happens on whatever host
+  actually runs the docker sandbox backend.

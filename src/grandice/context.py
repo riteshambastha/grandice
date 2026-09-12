@@ -11,6 +11,7 @@ import json
 from typing import Any
 
 from . import prompts
+from . import skills as skills_mod
 from .session import Session
 from .tools.base import CHARS_PER_TOKEN
 
@@ -23,7 +24,12 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
 
 def assemble(session: Session) -> list[dict[str, Any]]:
     """System prompt, transcript, and a constraint reminder near the end."""
-    out: list[dict[str, Any]] = [{"role": "system", "content": prompts.SYSTEM}]
+    system = prompts.SYSTEM
+    catalog = skills_mod.catalog(session.skills)  # Tier 1 (§07) — name + description only
+    if catalog:
+        system = f"{system}\n\n{catalog}"
+
+    out: list[dict[str, Any]] = [{"role": "system", "content": system}]
     out.extend(session.messages)
 
     if session.turns and session.turns % session.config.reinject_every == 0:

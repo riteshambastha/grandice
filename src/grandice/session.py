@@ -18,6 +18,7 @@ from .config import Config
 from .permissions import Gate
 from .router import Router
 from .sandbox import Sandbox
+from .skills import SkillMeta
 from .tools import Registry
 from .tools.todo import TodoList
 
@@ -30,6 +31,7 @@ class Session:
     registry: Registry
     gate: Gate
     todos: TodoList = field(default_factory=TodoList)
+    skills: list[SkillMeta] = field(default_factory=list)
 
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -66,15 +68,20 @@ class Session:
 
 def build(config: Config, gate: Gate) -> Session:
     from . import sandbox as sandbox_mod
+    from . import skills as skills_mod
     from .tools import build_registry
 
     box = sandbox_mod.build(config.sandbox, config.workspace, image=config.sandbox_image)
+    skills_dir = skills_mod.sync_into_workspace(config.workspace)
+    discovered = skills_mod.discover(skills_dir)
+
     todos = TodoList()
     return Session(
         config=config,
         router=Router(config),
         sandbox=box,
-        registry=build_registry(box, todos),
+        registry=build_registry(box, todos, skills=discovered),
         gate=gate,
         todos=todos,
+        skills=discovered,
     )
