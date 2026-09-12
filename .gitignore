@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+sessions.db
+sessions.db-wal
+sessions.db-shm
+workspace/*
+!workspace/.gitkeep
+.grandice/
+.DS_Store
+evals/results.jsonl

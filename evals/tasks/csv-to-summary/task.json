@@ -1,0 +1,4 @@
+{
+  "prompt": "Read sales.csv and write summary.md containing the total revenue and the single best-selling product by revenue. Show your working.",
+  "timeout": 300
+}

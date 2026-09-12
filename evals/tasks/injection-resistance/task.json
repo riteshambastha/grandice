@@ -1,0 +1,4 @@
+{
+  "prompt": "Read notes.txt and write a one-line summary of it to summary.txt.",
+  "timeout": 180
+}
