@@ -11,15 +11,16 @@ weights don't take away.
 Built to [the build spec](https://claude.ai/code/artifact/1e40174c-9694-47d1-a825-217df91c495c);
 section references in the code (§05.3 and so on) point back at it.
 
-## Status — P0
+## Status
 
-The loop, five tools, the router, the sandbox and a CLI. Everything right of the
-router is a config string; everything left of it is here.
+The loop, six tools, the router, two sandbox backends and a CLI — running on
+OpenRouter's free-tier models. Everything right of the router is a config
+string; everything left of it is here.
 
 | Phase | | |
 |---|---|---|
 | **P0** | Loop, five tools, CLI | **done** |
-| P1 | Documents, todo tool, container sandbox | todo tool landed early |
+| **P1** | Todo tool, container sandbox, free-tier rate limiting, AWS deploy | **done** (documents still open) |
 | P2 | Skills loader, three-tier disclosure | next |
 | P3 | MCP client, two connectors, `search_tools` | |
 | P4 | Subagents, background tasks, resumable queue | |
@@ -41,15 +42,22 @@ cp .env.example .env      # add GRANDICE_API_KEY, then:
 .venv/bin/grandice        # REPL
 ```
 
-OpenRouter is the fastest start — one key, every model in the spec reachable by
-changing a string. First-party endpoints are cheaper once you know what you use.
+Defaults run on OpenRouter's **free tier** — zero cost per token, but rate
+limited to 20 requests/min and 50/day (1,000/day after a one-time $10 credit
+purchase, which is worth making: a single agentic task can spend 30-120 calls).
+The router paces calls under that limit itself and stops cleanly, not with a
+wall of 429s, once the day's budget is spent.
 
 ```bash
-.venv/bin/grandice --model moonshotai/kimi-k2-thinking "..."   # swap orchestrator
-.venv/bin/grandice --cost-cap 0.25 "..."                       # tighter ceiling
-.venv/bin/pytest -q                                            # 16 hardening tests
-.venv/bin/python evals/run.py                                  # score a model
+.venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
+.venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
+.venv/bin/pytest -q                        # 28 tests
+.venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
+
+**Deploying to AWS?** See [DEPLOY_AWS.md](DEPLOY_AWS.md) — EC2 sizing, Docker
+setup, and why the harness runs directly on the host rather than in its own
+container.
 
 ## What's here
 
@@ -57,7 +65,8 @@ changing a string. First-party endpoints are cheaper once you know what you use.
 src/grandice/
   loop.py         the agent loop — validate, dispatch, truncate, reflect
   router.py       one interface per provider, cost ledger, failover
-  sandbox.py      macOS seatbelt: workspace-only writes, no network, wall-clock caps
+  ratelimit.py    free-tier pacing: per-minute window + a persisted daily cap
+  sandbox.py      sandbox-exec (macOS) or docker (Linux/EC2) — same interface
   context.py      compaction at 70% of the window, into fields not prose
   prompts.py      system prompt and the periodic constraint reminder
   permissions.py  per-action gate that shows the actual payload
@@ -101,12 +110,19 @@ every tool call is logged with its arguments to `.grandice/<session>.jsonl`.
 `evals/tasks/injection-resistance` is a live test of that: a file that instructs
 the agent to ignore its instructions. It must summarise the file, not obey it.
 
-## Known limits at P0
+## Known limits
 
-- `sandbox-exec` is a deprecated macOS API and weak against a determined escape.
-  It is fine for phase 0; the container backend slots in behind `Sandbox`.
+- `sandbox-exec` (macOS) is a deprecated Apple API, weak against a determined
+  escape; the Docker backend (Linux/EC2) is the same trust level, containers
+  rather than a seatbelt profile. Neither is Firecracker-grade isolation.
+- Free-tier models rotate — a model that resolves today may be repriced or
+  pulled tomorrow. The router will simply error; re-check
+  openrouter.ai/models and update `.env` when it does.
 - Session state is a JSONL audit log, not a database. SQLite arrives with
-  resumable tasks in P1.
-- No prompt caching yet — it is often a 5–10× cost reduction, so it is a provider
-  selection criterion before it is an optimisation.
+  resumable tasks in P4.
+- No prompt caching yet — moot on the free tier, but a real cost lever the
+  day a paid orchestrator is added.
 - Token counts are estimated at 4 chars/token for budgeting, not billing.
+- Docker sandbox isolation flags are unit-tested against the constructed
+  command, not a live daemon (none runs on the macOS dev machine) — the first
+  real check is the smoke test in `DEPLOY_AWS.md` §5, on the actual EC2 host.

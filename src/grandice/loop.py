@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import context
+from .ratelimit import DailyCapReached
 from .router import CostCapExceeded, Reply, ToolCall
 from .session import Session
 from .tools.base import Risk, tool_error, tool_result, truncate, validate
@@ -72,7 +73,7 @@ async def run_turn(session: Session, user_message: str) -> AsyncIterator[Event]:
                     yield TextDelta(item)
                 else:
                     reply = item
-        except CostCapExceeded as exc:
+        except (CostCapExceeded, DailyCapReached) as exc:
             reason = str(exc)
             break
         except Exception as exc:  # noqa: BLE001

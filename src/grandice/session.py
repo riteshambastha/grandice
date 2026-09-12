@@ -68,7 +68,7 @@ def build(config: Config, gate: Gate) -> Session:
     from . import sandbox as sandbox_mod
     from .tools import build_registry
 
-    box = sandbox_mod.build(config.sandbox, config.workspace)
+    box = sandbox_mod.build(config.sandbox, config.workspace, image=config.sandbox_image)
     todos = TodoList()
     return Session(
         config=config,

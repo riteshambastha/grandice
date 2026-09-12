@@ -4,9 +4,13 @@ Three rules hold whatever the backend: the workspace is the only writable path,
 network egress is denied rather than open, and every exec has a wall-clock cap
 so a runaway loop dies on its own.
 
-P0 ships the macOS `sandbox-exec` backend — free, zero install, and adequate
-against an incompetent agent rather than a determined attacker. The interface is
-the point: swapping in an OrbStack container later touches only this file.
+Two backends ship: `sandbox-exec` for local macOS development (free, zero
+install, adequate against an incompetent agent rather than a determined
+attacker) and `docker` for everywhere else, including EC2 — sandbox-exec is a
+macOS seatbelt API and does not exist on Linux. `Config.from_env()` picks
+between them by platform unless GRANDICE_SANDBOX overrides it. The interface is
+the point: both live behind `Sandbox`, so nothing above this file cares which
+one is running.
 """
 
 from __future__ import annotations
@@ -17,6 +21,8 @@ import shutil
 import signal
 import sys
 import tempfile
+import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -148,7 +154,12 @@ def _clean_env(cwd: Path) -> dict[str, str]:
     }
 
 
-async def _spawn(argv: list[str], cwd: Path, timeout: float) -> ExecResult:
+async def _spawn(
+    argv: list[str],
+    cwd: Path,
+    timeout: float,
+    on_timeout: Callable[[], Awaitable[None]] | None = None,
+) -> ExecResult:
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd),
@@ -160,6 +171,8 @@ async def _spawn(argv: list[str], cwd: Path, timeout: float) -> ExecResult:
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
+        if on_timeout is not None:
+            await on_timeout()  # e.g. `docker kill` — the local process alone may not stop it
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
@@ -174,14 +187,80 @@ async def _spawn(argv: list[str], cwd: Path, timeout: float) -> ExecResult:
     )
 
 
-def build(kind: str, workspace: Path) -> Sandbox:
+class DockerSandbox(Sandbox):
+    """A container per exec, for Linux hosts (EC2 included) where sandbox-exec
+    does not exist. Talks to the host's Docker daemon rather than nesting one —
+    the harness itself need not run inside a container for this to work.
+
+    The three rules from the module docstring hold the same way: the workspace
+    bind mount is the only writable path, `--network none` denies egress, and a
+    named container lets the timeout handler actually stop it — killing the
+    local `docker run` client alone can otherwise leave the container running
+    on the daemon.
+    """
+
+    name = "docker"
+
+    def __init__(self, workspace: Path, image: str = "python:3.12-slim") -> None:
+        super().__init__(workspace)
+        self.image = image
+        # Match the host user so writes through the bind mount land with usable
+        # permissions, without granting the container root.
+        self._uid = os.getuid() if hasattr(os, "getuid") else 1000
+        self._gid = os.getgid() if hasattr(os, "getgid") else 1000
+
+    async def run(self, command: str, timeout: float = 60.0) -> ExecResult:
+        container = f"grandice-{uuid.uuid4().hex[:12]}"
+        argv = [
+            "docker", "run", "--rm",
+            "--name", container,
+            "--network", "none",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--pids-limit", "256",
+            "--memory", "1g",
+            "--cpus", "1",
+            "--read-only",
+            "--tmpfs", "/tmp:rw,size=256m",
+            "-v", f"{self.workspace}:/workspace:rw",
+            "-w", "/workspace",
+            "-e", "HOME=/tmp",
+            "-e", "PATH=/usr/local/bin:/usr/bin:/bin",
+            "--user", f"{self._uid}:{self._gid}",
+            self.image,
+            "bash", "-c", command,
+        ]
+        return await _spawn(argv, self.workspace, timeout, on_timeout=lambda: _docker_kill(container))
+
+
+async def _docker_kill(container: str) -> None:
+    """Best-effort: stop the named container server-side. Killing the local
+    `docker run` client does not reliably stop it on the daemon."""
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "kill", container,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+
+
+def build(kind: str, workspace: Path, image: str = "python:3.12-slim") -> Sandbox:
     if kind == "sandbox-exec":
         if sys.platform != "darwin" or not shutil.which("sandbox-exec"):
             raise RuntimeError(
-                "sandbox-exec is macOS-only and was not found. Set GRANDICE_SANDBOX=none "
-                "to run unsandboxed against a throwaway directory, or move to a container."
+                "sandbox-exec is macOS-only and was not found. On Linux (including "
+                "EC2) set GRANDICE_SANDBOX=docker instead — from_env() does this "
+                "automatically when not on macOS."
             )
         return SandboxExec(workspace)
+    if kind == "docker":
+        if not shutil.which("docker"):
+            raise RuntimeError(
+                "GRANDICE_SANDBOX=docker but no `docker` binary was found. Install "
+                "Docker (see DEPLOY_AWS.md), or set GRANDICE_SANDBOX=none to run "
+                "unsandboxed against a throwaway directory."
+            )
+        return DockerSandbox(workspace, image=image)
     if kind == "none":
         return NoSandbox(workspace)
-    raise ValueError(f"Unknown sandbox backend {kind!r}. Use 'sandbox-exec' or 'none'.")
+    raise ValueError(f"Unknown sandbox backend {kind!r}. Use 'sandbox-exec', 'docker' or 'none'.")

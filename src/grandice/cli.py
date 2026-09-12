@@ -111,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="grandice", description=__doc__)
     parser.add_argument("task", nargs="?", help="Run one task and exit. Omit for a REPL.")
     parser.add_argument("--workspace", type=Path, help="Directory the agent may write to.")
-    parser.add_argument("--sandbox", choices=["sandbox-exec", "none"], help="Isolation backend.")
+    parser.add_argument("--sandbox", choices=["sandbox-exec", "docker", "none"], help="Isolation backend.")
     parser.add_argument("--model", help="Override the orchestrator model id.")
     parser.add_argument("--cost-cap", type=float, help="Per-session ceiling in USD.")
     parser.add_argument("--yes", action="store_true", help="Approve outward actions without asking.")

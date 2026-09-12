@@ -7,12 +7,14 @@ everything right of it is a config string.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Config
+from .ratelimit import RateLimiter
 
 # Rough $/Mtok (in, out) by tier, §11. Prices drift — treat as an estimate for
 # the cap, not an invoice.
@@ -103,6 +105,8 @@ class OpenAICompatBackend(Backend):
     """Every model in §03 speaks OpenAI-compatible tool calling. Point base_url
     at OpenRouter, a first-party vendor, or your own vLLM box — same code."""
 
+    MAX_RATE_LIMIT_RETRIES = 3
+
     def __init__(self, base_url: str, api_key: str, name: str = "openai-compat") -> None:
         from openai import AsyncOpenAI
 
@@ -110,6 +114,35 @@ class OpenAICompatBackend(Backend):
         self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
     async def complete(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        temperature: float,
+    ) -> AsyncIterator[str | Reply]:
+        from openai import RateLimitError
+
+        attempt = 0
+        while True:
+            try:
+                async for item in self._stream_once(model, messages, tools, temperature):
+                    yield item
+                return
+            except RateLimitError as exc:
+                # The proactive limiter (§ratelimit) should make this rare — it
+                # catches the case of another process sharing the same key, or
+                # the provider tightening the window without notice.
+                attempt += 1
+                if attempt > self.MAX_RATE_LIMIT_RETRIES:
+                    raise RuntimeError(
+                        f"Rate-limited {attempt - 1} times in a row by {model!r}. "
+                        f"The free tier's 20/min cap is likely shared with another "
+                        f"process. Wait a minute, or reduce concurrency."
+                    ) from exc
+                wait = _retry_after_seconds(exc) or (2**attempt)
+                await asyncio.sleep(wait)
+
+    async def _stream_once(
         self,
         model: str,
         messages: list[dict[str, Any]],
@@ -156,6 +189,16 @@ class OpenAICompatBackend(Backend):
             completion_tokens=completion_tokens,
             model=model,
         )
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Honour a provider's Retry-After header when it gives one."""
+    response = getattr(exc, "response", None)
+    header = getattr(response, "headers", {}).get("retry-after") if response else None
+    try:
+        return float(header) if header else None
+    except ValueError:
+        return None
 
 
 def _parse_call(slot: dict[str, str]) -> ToolCall:
@@ -208,7 +251,7 @@ class StubBackend(Backend):
         text = (
             "[stub router] No GRANDICE_API_KEY set, so this is a scripted reply.\n"
             "The loop, tools, validation and cost ledger are all real — only the "
-            "model is fake. Add a key to .env to run this against GLM-4.6 or Kimi K2.\n"
+            "model is fake. Add a key to .env to run this against a real model.\n"
         )
         for line in text.splitlines(keepends=True):
             yield line
@@ -216,20 +259,39 @@ class StubBackend(Backend):
 
 
 class Router:
-    """Tries each backend in order. A provider outage should degrade, not stop."""
+    """Tries each backend in order. A provider outage should degrade, not stop.
 
-    def __init__(self, config: Config, backends: list[Backend] | None = None) -> None:
+    The stub is deliberately NOT in the live failover chain. Falling back to
+    scripted text on a real error would look, from inside the loop, exactly
+    like the model responding — the session would silently stop meaning
+    anything. Live mode fails loudly instead; only "no key configured" gets
+    the stub.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        backends: list[Backend] | None = None,
+        rate_limiter: RateLimiter | None = None,
+    ) -> None:
         self.config = config
         self.ledger = Ledger(cap_usd=config.cost_cap_usd)
         if backends is not None:
             self.backends = backends
         elif config.live:
-            self.backends = [
-                OpenAICompatBackend(config.base_url, config.api_key, name="primary"),
-                StubBackend(),
-            ]
+            self.backends = [OpenAICompatBackend(config.base_url, config.api_key, name="primary")]
         else:
             self.backends = [StubBackend()]
+
+        self.rate_limiter = rate_limiter if rate_limiter is not None else (
+            RateLimiter(
+                per_minute=config.requests_per_minute,
+                per_day=config.daily_request_cap,
+                state_path=config.workspace.parent / ".grandice" / "rate_limit.json",
+            )
+            if config.live
+            else None
+        )
 
     def model_for(self, tier: str) -> str:
         return getattr(self.config.tiers, tier)
@@ -243,6 +305,9 @@ class Router:
     ) -> AsyncIterator[str | Reply]:
         """Yields text deltas, then exactly one Reply as the final item."""
         self.ledger.check()
+        if self.rate_limiter is not None:
+            await self.rate_limiter.acquire()  # may raise DailyCapReached
+
         model = self.model_for(tier)
         temp = self.config.temperature if temperature is None else temperature
 
