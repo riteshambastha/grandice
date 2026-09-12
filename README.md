@@ -13,10 +13,11 @@ section references in the code (§05.3 and so on) point back at it.
 
 ## Status
 
-The loop, eight core tools, a skills loader with two document skills, two MCP
-connectors, the router, two sandbox backends, a CLI, and a live-view web
-dashboard — running on OpenRouter's free-tier models. Everything right of the
-router is a config string; everything left of it is here.
+The loop, twelve core tools, a skills loader with two document skills, two MCP
+connectors, subagents with a persisted background-task queue, the router, two
+sandbox backends, a CLI, and a live-view web dashboard — running on
+OpenRouter's free-tier models. Everything right of the router is a config
+string; everything left of it is here.
 
 | Phase | | |
 |---|---|---|
@@ -24,7 +25,7 @@ router is a config string; everything left of it is here.
 | **P1** | Todo tool, container sandbox, free-tier rate limiting, AWS deploy | **done** |
 | **P2** | Skills loader, three-tier disclosure | **done** (xlsx, pptx — docx, pdf not yet written) |
 | **P3** | MCP client, two connectors, `search_tools` | **done** |
-| P4 | Subagents, background tasks, resumable queue | next |
+| **P4** | Subagents, background tasks, resumable queue | **done** |
 | P5 | Client — chat, file tree, diff, task board | **partial** — see "Live view" below |
 
 ## Run it
@@ -52,7 +53,7 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 79 tests
+.venv/bin/pytest -q                        # 100 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
@@ -163,6 +164,42 @@ verify by actually starting the server and calling `list_tools()`/
 `call_tool()` against it, the same way these two were checked, rather than
 assuming risk or schema shape from documentation.
 
+## Subagents & background tasks
+
+`spawn_subagent(task, tools=None)` runs a bounded piece of work in its own
+isolated context — its own message history, its own plan — and returns only
+the final report. The point is keeping a side-investigation out of the
+orchestrator's own window: a twenty-step detour into "what's actually in
+these twelve files" shows up as one tool result, not twenty turns of noise.
+Runs on the **worker** tier by default (§03's own tier table — bounded,
+mechanical work doesn't need the orchestrator's reasoning budget), and
+shares the parent's `Router` rather than getting a fresh one, so the cost
+ledger and rate limiter correctly aggregate across a session and everything
+it spawns.
+
+Two hard rules, enforced in `subagents.py`, not left to the caller's
+judgment: a subagent never receives an outward-facing tool regardless of
+what's requested (§08 — "a tool set with no outward-facing capability at
+all"), and never receives the spawn/task tools themselves — no nested
+subagents in this build, a flat one-level hierarchy on purpose.
+
+`spawn_background(task, tools=None)` is the same thing without waiting —
+returns a task id immediately; check on it with `check_task(task_id)` or see
+everything with `list_tasks()` (or `/tasks` in the CLI, or the "Background
+tasks" panel in the dashboard). Tasks persist in `.grandice/tasks.db`
+(SQLite — §09's own stack pick for exactly this), shared across every
+session against a workspace, so a task started in one run still shows up
+after a restart.
+
+**"Resumable" is scoped honestly, not oversold.** A task's record — status,
+description, result — survives a process restart; one caught `running` when
+the process dies is marked `interrupted` on the next startup rather than
+silently lost. It does **not** mean the exact in-progress conversation picks
+back up mid-transcript — that would need checkpointing the subagent's
+message list at every step, which isn't built. "Resuming" an interrupted
+task today means `spawn_background`-ing the same description again, with
+full knowledge it didn't finish last time.
+
 ## What's here
 
 ```
@@ -176,7 +213,10 @@ src/grandice/
   prompts.py      system prompt and the periodic constraint reminder
   permissions.py  per-action gate that shows the actual payload
   mcp_client.py   MCP connectors — start a server, wrap its tools as latent ToolSpecs
-  tools/          read, write, edit, glob, bash, todo, load_skill, search_tools
+  subagents.py    isolated child sessions, sharing the parent's router + sandbox
+  tasks.py        SQLite-backed background task queue (.grandice/tasks.db)
+  tools/          read, write, edit, glob, bash, todo, load_skill, search_tools,
+                  spawn_subagent, spawn_background, check_task, list_tasks
   server/         FastAPI + SSE live-view dashboard (app.py, broadcast.py, static/)
 skills/           xlsx, pptx — canonical source, mirrored into workspace/.skills/
 sandbox/          Dockerfile for the sandbox execution image (not the harness)
@@ -243,10 +283,13 @@ the agent to ignore its instructions. It must summarise the file, not obey it.
 - The dashboard has **no authentication** — its only protection is binding to
   `127.0.0.1` by default. Do not point `--host` at a public interface without
   adding auth in front of it first; use an SSH tunnel instead.
-- The dashboard holds one `Session` and runs one task at a time — multiple
-  browser tabs can watch it, but not run independent tasks concurrently. That
-  matches the CLI's model exactly; multi-session support is a P4-and-later
-  concern (subagents, a real task queue), not something this pass changes.
+- The dashboard holds one `Session` and runs one **top-level** task at a
+  time — multiple browser tabs can watch it, but not start independent
+  top-level tasks concurrently. `spawn_background` genuinely runs work
+  concurrently underneath that one task, which is real progress from before
+  P4, but the top-level constraint itself is still there; a queue of
+  independent top-level tasks would need multiple sessions, not addressed
+  here.
 - `mcp` is pinned to 1.x, not the newest release — see "Connectors" above.
   This ecosystem is moving fast enough that a routine `pip install --upgrade`
   could silently break both connectors; the pin is deliberate, not an
@@ -257,3 +300,15 @@ the agent to ignore its instructions. It must summarise the file, not obey it.
   yet. Adding one is the same shape (see "Connectors" above), but a
   credentialed connector also needs a place to hold the credential — not
   designed here.
+- Subagents are a flat, one-level hierarchy — they cannot themselves spawn
+  subagents. Deliberate scope for this pass, not a technical ceiling; lifting
+  it is mostly relaxing `_RECURSIVE_TOOL_NAMES` in `subagents.py`, but that
+  also reopens the runaway-recursive-cost question this restriction sidesteps.
+- A background task's completion isn't pushed live to the dashboard the way
+  the main task's events are — `spawn_background` runs outside the SSE
+  broadcaster entirely. It shows up in the "Background tasks" panel on the
+  next state refresh (after the current turn finishes, or a page reload),
+  not the instant it actually finishes. Real-time push for this is P5's
+  fuller task board, not built here.
+- `.grandice/tasks.db` has no pruning — it grows forever. Fine at the scale
+  this has been used at; revisit if it matters.

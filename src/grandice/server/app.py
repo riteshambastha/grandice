@@ -56,6 +56,7 @@ def create_app(session: Session | None = None) -> FastAPI:
             yield
         finally:
             await stop_connectors(state.session)
+            state.session.tasks.close()
 
     app = FastAPI(title="grandice", lifespan=lifespan)
     app.state.grandice = state  # exposed for tests; routes below close over `state` directly
@@ -155,6 +156,13 @@ def _snapshot(state: AppState) -> dict[str, Any]:
             "active": session.registry.names(),
             "latent": [s.name for s in session.registry.latent()],
         },
+        "tasks": [
+            {
+                "id": t.id, "status": t.status.value, "description": t.description,
+                "result": t.result, "error": t.error,
+            }
+            for t in session.tasks.list()[:20]  # newest first, already ordered by the store
+        ],
         "cost": {
             "spent_usd": round(ledger.spent_usd, 4),
             "cap_usd": ledger.cap_usd,

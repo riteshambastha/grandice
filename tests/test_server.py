@@ -97,6 +97,18 @@ def test_state_reports_model_sandbox_and_zero_cost(client, session):
     assert body["cost"]["spent_usd"] == 0.0
     assert body["rate_limit"] is None  # stub mode: nothing to pace
     assert {s["name"] for s in body["skills"]} == {"xlsx", "pptx"}
+    assert body["tasks"] == []
+
+
+def test_state_reports_background_tasks(client, session):
+    task_id = session.tasks.create("subagent", "investigate something")
+    session.tasks.mark_done(task_id, "found it")
+
+    body = client.get("/api/state").json()
+    assert body["tasks"] == [
+        {"id": task_id, "status": "done", "description": "investigate something",
+         "result": "found it", "error": None}
+    ]
 
 
 def test_files_lists_the_workspace_root(client, session):

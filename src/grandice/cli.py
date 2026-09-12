@@ -76,7 +76,10 @@ async def _drive(session: Session, message: str) -> None:
 
 async def _repl(session: Session) -> None:
     _banner(session)
-    console.print("[dim]Type a task. /plan shows the plan, /cost the ledger, /quit exits.[/]\n")
+    console.print(
+        "[dim]Type a task. /plan shows the plan, /cost the ledger, "
+        "/tasks background tasks, /quit exits.[/]\n"
+    )
     while True:
         try:
             message = await asyncio.get_event_loop().run_in_executor(
@@ -98,6 +101,13 @@ async def _repl(session: Session) -> None:
                 f"${led.spent_usd:.4f} of ${led.cap_usd:.2f} · {led.calls} calls · "
                 f"{led.prompt_tokens:,} in / {led.completion_tokens:,} out"
             )
+            continue
+        if command == "/tasks":
+            tasks = session.tasks.list()
+            if not tasks:
+                console.print("[dim]No background tasks yet.[/]")
+            for t in tasks:
+                console.print(f"{t.id} [{t.status.value}] {t.description[:70]}")
             continue
         if not command:
             continue
@@ -155,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
                 await _repl(session)
         finally:
             await stop_connectors(session)
+            session.tasks.close()
 
     try:
         asyncio.run(_run())

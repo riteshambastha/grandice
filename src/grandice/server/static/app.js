@@ -8,6 +8,7 @@ const $planList = document.getElementById("plan-list");
 const $costPanel = document.getElementById("cost-panel");
 const $skillsList = document.getElementById("skills-list");
 const $toolsPanel = document.getElementById("tools-panel");
+const $tasksList = document.getElementById("tasks-list");
 const $fileList = document.getElementById("file-list");
 const $breadcrumb = document.getElementById("file-breadcrumb");
 const $badgeLive = document.getElementById("badge-live");
@@ -89,6 +90,16 @@ function renderState(state) {
     <div class="muted">${escapeHtml(connectorsLine)}</div>
     <div style="margin-top:6px">${escapeHtml(state.tools.active.join(", "))}</div>
     <div class="muted" style="margin-top:6px">${escapeHtml(latentLine)}</div>`;
+
+  $tasksList.innerHTML = state.tasks.length
+    ? state.tasks.map(t => {
+        const body = t.status === "done" ? t.result : t.status === "failed" ? t.error : null;
+        return `<li>
+          <div><span class="task-status ${t.status}">${t.status}</span> ${escapeHtml(t.description)}</div>
+          ${body ? `<div class="task-body">${escapeHtml(body)}</div>` : ""}
+        </li>`;
+      }).join("")
+    : '<li class="muted">No background tasks yet.</li>';
 }
 
 function setRunning(running) {

@@ -19,6 +19,7 @@ from .permissions import Gate
 from .router import Router
 from .sandbox import Sandbox
 from .skills import SkillMeta
+from .tasks import TaskStore
 from .tools import Registry
 from .tools.todo import TodoList
 
@@ -33,6 +34,7 @@ class Session:
     sandbox: Sandbox
     registry: Registry
     gate: Gate
+    tasks: TaskStore
     todos: TodoList = field(default_factory=TodoList)
     skills: list[SkillMeta] = field(default_factory=list)
     connectors: "list[Connector]" = field(default_factory=list)
@@ -92,17 +94,33 @@ def build(config: Config, gate: Gate) -> Session:
             for name in config.mcp_connectors
         ]
 
+    # Shared across every session against this workspace, not per-session —
+    # a background task spawned in one run should still show up in
+    # list_tasks after a restart (§P4).
+    tasks = TaskStore(config.workspace.parent / ".grandice" / "tasks.db")
+
     todos = TodoList()
-    return Session(
+    registry = build_registry(box, todos, skills=discovered)
+    session = Session(
         config=config,
         router=Router(config),
         sandbox=box,
-        registry=build_registry(box, todos, skills=discovered),
+        registry=registry,
         gate=gate,
+        tasks=tasks,
         todos=todos,
         skills=discovered,
         connectors=connectors,
     )
+
+    # The subagent tools close over `session` itself, so they're added once
+    # it exists — same reasoning as search_tools needing the registry.
+    from .tools import subagent as subagent_tool
+
+    for spec in subagent_tool.build(session):
+        registry.add(spec)
+
+    return session
 
 
 async def start_connectors(session: Session) -> None:

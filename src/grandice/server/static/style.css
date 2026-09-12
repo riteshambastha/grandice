@@ -176,6 +176,14 @@ button:disabled { opacity: 0.4; cursor: default; }
 .skills-list .skill-name { color: var(--accent); font-family: var(--mono); font-weight: 600; }
 .skills-list .skill-desc { color: var(--ink-3); display: block; }
 
+.tasks-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; font-size: 12px; max-height: 160px; overflow-y: auto; }
+.task-status { font-family: var(--mono); font-size: 10px; text-transform: uppercase; padding: 1px 5px; border-radius: 2px; background: var(--sunk); color: var(--ink-3); }
+.task-status.done { color: var(--good); }
+.task-status.failed { color: var(--crit); }
+.task-status.running, .task-status.pending { color: var(--accent); }
+.task-status.interrupted { color: var(--warn); }
+.task-body { color: var(--ink-3); margin-top: 3px; font-size: 11px; }
+
 .files-panel { max-height: 260px; }
 .breadcrumb { font-family: var(--mono); font-size: 11px; color: var(--ink-3); margin-bottom: 6px; }
 .breadcrumb span { cursor: pointer; }

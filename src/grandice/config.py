@@ -66,6 +66,11 @@ class Config:
     mcp_connectors: tuple[str, ...] = ()
     mcp_sqlite_path: str = "workspace.db"  # relative to the workspace
 
+    # Subagents (§P4). A smaller cap than max_steps — bounded, mechanical
+    # work is the point; a subagent that needs 120 steps should probably be
+    # the orchestrator's own job instead.
+    subagent_max_steps: int = 40
+
     @property
     def live(self) -> bool:
         """False means the stub router — the loop still runs, nothing is billed."""
@@ -92,4 +97,5 @@ class Config:
                 c.strip() for c in os.getenv("GRANDICE_MCP_CONNECTORS", "").split(",") if c.strip()
             ),
             mcp_sqlite_path=os.getenv("GRANDICE_MCP_SQLITE_PATH", "workspace.db"),
+            subagent_max_steps=int(os.getenv("GRANDICE_SUBAGENT_MAX_STEPS", "40")),
         )

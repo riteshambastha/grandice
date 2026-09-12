@@ -48,8 +48,17 @@ class Finished:
 Event = TextDelta | ToolStarted | ToolFinished | Finished
 
 
-async def run_turn(session: Session, user_message: str) -> AsyncIterator[Event]:
-    """One user message to completion. Yields events for the client to render."""
+async def run_turn(
+    session: Session, user_message: str, tier: str = "orchestrator"
+) -> AsyncIterator[Event]:
+    """One user message to completion. Yields events for the client to render.
+
+    `tier` picks which model tier drives this turn (§03) — subagents (§P4)
+    run on "worker" by default, since bounded, mechanical work doesn't need
+    the orchestrator's own reasoning budget. The router instance is shared
+    with the parent session regardless of tier, so the cost ledger and rate
+    limiter aggregate correctly across a session and any subagents it spawns.
+    """
     session.messages.append({"role": "user", "content": user_message})
     session.turns += 1
     session.log("user", content=user_message)
@@ -65,7 +74,7 @@ async def run_turn(session: Session, user_message: str) -> AsyncIterator[Event]:
             # Streamed straight through: text reaches the client as the model
             # produces it, not after the turn resolves.
             async for item in session.router.complete(
-                tier="orchestrator",
+                tier=tier,
                 messages=context.assemble(session),
                 tools=context.active_tools(session),
             ):
