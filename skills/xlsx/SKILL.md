@@ -79,6 +79,19 @@ ws["D2"].number_format = "$#,##0.00"   # $1,234.50
 ws["E2"].number_format = "yyyy-mm-dd"
 ```
 
+**Percent format displays a fraction, not the whole number.** A `0.0%` format
+multiplies the cell's stored value by 100 for display — store `0.12`, not
+`12`, or the sheet will show `1200.0%`. Compute the fraction in Python; let
+the format do the scaling.
+
+**Dates must be real date objects, not strings.** Write a Python `date` or
+`datetime` — `ws["E2"] = date(2026, 3, 15)` — and openpyxl applies a sensible
+date format automatically. Writing `"2026-03-15"` as a plain string looks
+identical at a glance but Excel treats it as text: it won't sort
+chronologically, can't be used in a date formula, and `SUM`/date arithmetic
+over that column silently does nothing. If a source CSV gave you date
+strings, parse them (`datetime.strptime` or similar) before writing.
+
 **Styling** is per cell — there is no "style this whole range" shortcut
 except looping:
 
@@ -94,10 +107,23 @@ for cell in ws[1]:  # row 1
 ```
 
 **Column widths** are never auto-fit — openpyxl cannot measure rendered text
-width. Set them explicitly or the output will look cramped:
+width. Set them explicitly or the output will look cramped. A rough
+character-count heuristic is enough for most reports:
 
 ```python
-ws.column_dimensions["A"].width = 24
+for col_cells in ws.columns:
+    letter = col_cells[0].column_letter
+    longest = max(len(str(c.value)) for c in col_cells if c.value is not None)
+    ws.column_dimensions[letter].width = longest + 2
+```
+
+**Freeze the header row** on anything more than a few rows long, so it stays
+visible while scrolling — cheap, and it's what makes a sheet read as a
+finished report rather than a raw data dump:
+
+```python
+ws.freeze_panes = "A2"  # freezes row 1; the pane reference is the first
+                         # scrollable cell, not the last frozen one
 ```
 
 **Merged cells**: `ws.merge_cells("A1:C1")` — only the top-left cell (`A1`)

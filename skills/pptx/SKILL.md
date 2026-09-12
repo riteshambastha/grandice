@@ -64,6 +64,25 @@ no suitable placeholder.
 Always enumerate `slide.placeholders` first rather than assuming index `1`
 or `2` exists — different layouts expose different placeholders.
 
+## Bullet lists
+
+A body placeholder holds one paragraph per bullet point — setting `.text`
+once gives you a single line, which is rarely what "produce a summary as
+slides" actually means. Add one paragraph per point instead:
+
+```python
+tf = slide.placeholders[1].text_frame
+tf.text = "Headcount flat this quarter"          # first bullet — sets paragraph 0
+for point in ["Two projects slipped to Q3", "Budget on track"]:
+    p = tf.add_paragraph()
+    p.text = point
+```
+
+Every paragraph renders at the same outline level by default. For a
+sub-bullet, set `p.level = 1` (0-indexed; how many levels an existing layout
+actually supports depends on its master, so don't assume more than one or
+two are safe without checking the template).
+
 ## Units are EMU — use the helpers, not raw integers
 
 ```python
@@ -72,6 +91,12 @@ from pptx.util import Inches, Pt, Emu
 slide.shapes.add_textbox(Inches(1), Inches(2), Inches(4), Inches(1))
 run.font.size = Pt(18)
 ```
+
+Check `prs.slide_width` / `prs.slide_height` before placing a free-floating
+shape (textbox, picture, chart) by hand — a 16:9 template is 13.33in wide, a
+4:3 one is 10in, and a position that looks right on one runs off the edge of
+the other. Placeholders don't have this problem since their position comes
+from the layout; it only matters for shapes you position yourself.
 
 ## Per-word formatting needs runs, not paragraph.text
 
