@@ -34,10 +34,17 @@ web = ["fastapi>=0.115", "uvicorn>=0.30"]
 # name outright; mcp-server-sqlite uses the pre-2.x decorator API). See
 # mcp_client.py's module docstring before ever bumping these.
 mcp = ["mcp==1.30.0", "mcp-server-fetch==2026.8.18", "mcp-server-sqlite==2025.4.25"]
+# The native desktop shell (§ desktop.py). Needs `web` too — it embeds the
+# same FastAPI app grandice-web serves. pywebview picks the right native
+# backend per OS itself (WKWebView/WebView2/GTK WebKit); nothing here is
+# platform-specific, though only the macOS path is verified in this repo's
+# own dev environment — see DESKTOP_APP.md.
+desktop = ["pywebview>=5.0"]
 
 [project.scripts]
 grandice = "grandice.cli:main"
 grandice-web = "grandice.server.app:main"
+grandice-desktop = "grandice.desktop:main"
 
 [build-system]
 requires = ["hatchling"]

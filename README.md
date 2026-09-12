@@ -15,9 +15,9 @@ section references in the code (§05.3 and so on) point back at it.
 
 The loop, twelve core tools, a skills loader with four document skills, two MCP
 connectors, subagents with a persisted background-task queue, the router, two
-sandbox backends, a CLI, and a live-view web dashboard — running on
-OpenRouter's free-tier models. Everything right of the router is a config
-string; everything left of it is here.
+sandbox backends, a CLI, a live-view web dashboard, and a native desktop app
+for macOS and Windows — running on OpenRouter's free-tier models. Everything
+right of the router is a config string; everything left of it is here.
 
 | Phase | | |
 |---|---|---|
@@ -53,7 +53,7 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 114 tests
+.venv/bin/pytest -q                        # 118 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
@@ -109,6 +109,31 @@ Binds to `127.0.0.1` by default — nothing is exposed even on an EC2 box unless
 you deliberately pass `--host`. To view a remote instance, tunnel instead of
 opening a port: `ssh -L 8000:localhost:8000 <host>`, then browse
 `http://127.0.0.1:8000` locally.
+
+## Desktop app
+
+The same dashboard as a native window instead of a browser tab — one
+process, `pywebview` opening the OS's own webview onto a FastAPI server
+embedded in a background thread. Nothing platform-specific in the code;
+pywebview picks WKWebView, WebView2 or GTK WebKit itself.
+
+```bash
+.venv/bin/pip install -e ".[web,desktop]"
+.venv/bin/grandice-desktop
+```
+
+A standalone packaged app (`.app` on macOS, `.exe` on Windows) builds from
+one PyInstaller spec for both: `./desktop/build_mac.sh` or `.\desktop\
+build_windows.ps1`. The macOS build is verified — built, launched as the
+actual frozen binary (not run from source), and checked over real HTTP that
+it found all four skills and every tool from inside the bundle alone. The
+Windows path is written to be correct but **not verified the same way** —
+this dev environment is macOS-only. See [DESKTOP_APP.md](DESKTOP_APP.md)
+for exactly what that distinction means, the two frozen-app path-resolution
+fixes packaging required, and a real, pre-existing gap worth knowing before
+relying on a Windows build: there's no lightweight sandbox for Windows yet,
+so it either needs Docker Desktop (the existing default) or runs
+unsandboxed.
 
 ## Skills
 
@@ -240,8 +265,10 @@ src/grandice/
   tools/          read, write, edit, glob, bash, todo, load_skill, search_tools,
                   spawn_subagent, spawn_background, check_task, list_tasks
   server/         FastAPI + SSE live-view dashboard (app.py, broadcast.py, static/)
-skills/           xlsx, pptx — canonical source, mirrored into workspace/.skills/
+  desktop.py      native window shell — embeds server/app.py via pywebview
+skills/           xlsx, pptx, docx, pdf — canonical source, mirrored into workspace/.skills/
 sandbox/          Dockerfile for the sandbox execution image (not the harness)
+desktop/          PyInstaller spec + build scripts for the standalone app
 evals/            pass/fail tasks with mechanical checks — run on every model swap
 ```
 
@@ -344,3 +371,11 @@ the agent to ignore its instructions. It must summarise the file, not obey it.
 - The diff view and approval modal are single-file/single-request — no
   tree-wide "review everything this turn changed" view, and approvals queue
   one at a time rather than showing several at once.
+- The desktop app's Windows build is written to be correct but not
+  verified the same way the macOS one was (no Windows machine in this dev
+  environment) — see [DESKTOP_APP.md](DESKTOP_APP.md). Same document for
+  the real, pre-existing gap it surfaces: no lightweight Windows sandbox,
+  so a Windows install either needs Docker Desktop or runs unsandboxed.
+- No code signing on either desktop build — expect a Gatekeeper/SmartScreen
+  warning on first launch. Normal for unsigned early-stage software, not
+  something fixed here (needs paid certificates on both platforms).

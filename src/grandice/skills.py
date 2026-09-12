@@ -21,10 +21,27 @@ so a skill living anywhere else would be invisible inside the container.
 from __future__ import annotations
 
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-REPO_SKILLS_DIR = Path(__file__).resolve().parents[2] / "skills"
+
+def _default_skills_dir() -> Path:
+    """Where canonical skills live, for however this process was started.
+
+    In a normal source checkout or editable install, that's the repo's
+    top-level skills/ directory — two levels up from this file. Under
+    PyInstaller, `__file__`-based climbing breaks: files are extracted to a
+    temp directory (`sys._MEIPASS`) with a different layout, and there is no
+    "repo root" at all. The desktop build's spec bundles skills/ at the
+    bundle root to match, so frozen apps look there instead.
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / "skills"
+    return Path(__file__).resolve().parents[2] / "skills"
+
+
+REPO_SKILLS_DIR = _default_skills_dir()
 WORKSPACE_SUBDIR = ".skills"
 
 
