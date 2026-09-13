@@ -16,13 +16,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -41,11 +42,34 @@ KEEPALIVE_SECONDS = 15
 FILE_PREVIEW_LIMIT = 100_000  # characters — same truncate-on-the-way-in spirit as §05.4
 APPROVAL_TIMEOUT_SECONDS = 300  # an unanswered approval denies itself rather than hanging the turn forever
 TASK_POLL_SECONDS = 2  # how often the background-task poller checks for status changes
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # a generous but bounded per-file attachment size
+UPLOADS_DIRNAME = "uploads"  # workspace-relative — the same place `read`/`glob` would look
 
 SESSION_COOKIE = "grandice_session"
 ACCOUNTS_DB_PATH = Path.home() / ".grandice" / "accounts.db"
 PROJECTS_DB_PATH = Path.home() / ".grandice" / "projects.db"
 PROJECTS_ROOT = Path.home() / "Documents" / "grandice" / "projects"
+
+
+class NoCacheStaticFiles(StaticFiles):
+    """Real bug hit while developing the dashboard's rich-chat features:
+    Starlette's default StaticFiles sends no Cache-Control header at all,
+    and a browser can then keep serving an old app.js/style.css for a
+    while after a real change on disk, with no request ever reaching the
+    server to reveal it. `no-cache` (revalidate-before-use) turned out not
+    to be a strong enough guarantee in practice during this same live
+    testing — confirmed directly: executing code in the page still had
+    stale function definitions even after a hard reload. `no-store` is
+    unambiguous instead: never keep a cached copy of these files at all, so
+    every load is a real request and an update always takes effect on the
+    very next one. These files are small and this is a low-traffic
+    dev/self-hosted dashboard, not a CDN-fronted production site, so the
+    cost of never caching them is negligible next to the alternative."""
+
+    def file_response(self, *args: Any, **kwargs: Any):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 class RegisterIn(BaseModel):
@@ -66,8 +90,21 @@ class ChatIn(BaseModel):
     title: str = "New chat"
 
 
+class ChatUpdateIn(BaseModel):
+    """Both optional so a client can rename, change the model, or both in
+    one PATCH — unlike creation, where a title is always meaningful. An
+    absent `title` leaves it unchanged; an absent `model` leaves it
+    unchanged too, while an explicit `model: ""` clears it back to the
+    session's own default (there's no other way to tell "clear this" apart
+    from "don't touch this" once both are just Optional[str])."""
+
+    title: str | None = None
+    model: str | None = None
+
+
 class TaskIn(BaseModel):
     message: str
+    attachments: list[str] = []  # workspace-relative paths, from a prior /upload call
 
 
 class ApproveIn(BaseModel):
@@ -209,9 +246,14 @@ def create_app(
             raise HTTPException(404, str(exc)) from exc
 
     @app.patch("/api/chats/{chat_id}")
-    async def rename_chat(chat_id: str, body: ChatIn, user: User = Depends(current_user)) -> dict[str, Any]:
+    async def update_chat(chat_id: str, body: ChatUpdateIn, user: User = Depends(current_user)) -> dict[str, Any]:
         try:
-            state.projects.rename_chat(chat_id, user.id, body.title)
+            if body.title is not None:
+                state.projects.rename_chat(chat_id, user.id, body.title)
+            if body.model is not None:
+                # An explicit "" means "clear it back to the session default" —
+                # see ChatUpdateIn's own docstring for why that's how this works.
+                state.projects.set_chat_model(chat_id, user.id, body.model or None)
             return _chat_dict(state.projects.get_chat(chat_id, user.id))
         except NotFound as exc:
             raise HTTPException(404, str(exc)) from exc
@@ -247,6 +289,26 @@ def create_app(
         _, runtime = await _resolve(state, chat_id, user)
         return _read_file(runtime.session, path)
 
+    @app.get("/api/chats/{chat_id}/models")
+    async def chat_models(chat_id: str, user: User = Depends(current_user)) -> dict[str, Any]:
+        chat, runtime = await _resolve(state, chat_id, user)
+        return {"models": await runtime.session.router.list_models(), "current": chat.model}
+
+    @app.post("/api/chats/{chat_id}/upload", status_code=201)
+    async def chat_upload(
+        chat_id: str, file: UploadFile, user: User = Depends(current_user)
+    ) -> dict[str, Any]:
+        _, runtime = await _resolve(state, chat_id, user)
+        data = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit.")
+        rel_path = _save_upload(runtime.session, file.filename or "upload", data)
+        return {
+            "path": rel_path,
+            "name": Path(rel_path).name,
+            "size": len(data),
+        }
+
     @app.post("/api/chats/{chat_id}/task", status_code=202)
     async def chat_task(chat_id: str, body: TaskIn, user: User = Depends(current_user)) -> dict[str, Any]:
         if not body.message.strip():
@@ -258,7 +320,7 @@ def create_app(
         # requests on the same event loop cannot both pass the check.
         runtime.running = True
         runtime.session.cancelled = False
-        asyncio.create_task(_run(state, chat, runtime, body.message))
+        asyncio.create_task(_run(state, chat, runtime, body.message, body.attachments))
         return {"status": "started"}
 
     @app.post("/api/chats/{chat_id}/cancel")
@@ -285,7 +347,7 @@ def create_app(
 
     # Mounted last: StaticFiles(html=True) serves index.html at "/" and would
     # otherwise shadow any /api/* route registered after it.
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    app.mount("/", NoCacheStaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app
 
 
@@ -304,7 +366,7 @@ def _project_dict(p) -> dict[str, Any]:
 
 def _chat_dict(c: Chat) -> dict[str, Any]:
     return {"id": c.id, "project_id": c.project_id, "title": c.title,
-            "created_at": c.created_at, "updated_at": c.updated_at}
+            "created_at": c.created_at, "updated_at": c.updated_at, "model": c.model}
 
 
 async def _resolve(state: AppState, chat_id: str, user: User) -> tuple[Chat, ChatRuntime]:
@@ -376,9 +438,38 @@ def _project_workspace(state: AppState, project_id: str) -> Path:
     return state.projects_root / project_id / "workspace"
 
 
-async def _run(state: AppState, chat: Chat, runtime: ChatRuntime, message: str) -> None:
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _save_upload(session: Session, original_name: str, data: bytes) -> str:
+    """Saves into <workspace>/uploads/ under a sanitized version of the
+    original filename, so a name from the client is never used as-is for a
+    path on disk — strips any directory component first (a browser's
+    File.name is just a filename, but this is still attacker-reachable
+    input) and replaces anything outside a safe charset. Adds a short
+    suffix on collision rather than overwriting an existing upload."""
+    safe_name = _UNSAFE_FILENAME_CHARS.sub("_", Path(original_name).name) or "upload"
+    uploads_dir = session.sandbox.workspace / UPLOADS_DIRNAME
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
+    candidate = uploads_dir / safe_name
+    n = 1
+    while candidate.exists():
+        candidate = uploads_dir / f"{stem}-{n}{suffix}"
+        n += 1
+
+    candidate.write_bytes(data)
+    return str(candidate.relative_to(session.sandbox.workspace))
+
+
+async def _run(
+    state: AppState, chat: Chat, runtime: ChatRuntime, message: str, attachments: list[str]
+) -> None:
     try:
-        async for event in agent_loop.run_turn(runtime.session, message):
+        async for event in agent_loop.run_turn(
+            runtime.session, message, model=chat.model, attachments=attachments
+        ):
             runtime.broadcaster.publish(event_to_dict(event))
     finally:
         runtime.running = False

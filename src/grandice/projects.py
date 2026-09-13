@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -40,9 +41,12 @@ CREATE TABLE IF NOT EXISTS chats (
     title TEXT NOT NULL,
     messages_json TEXT NOT NULL DEFAULT '[]',
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    model TEXT
 );
 """
+
+_CHAT_COLUMNS = "id, project_id, user_id, title, created_at, updated_at, model"
 
 
 @dataclass
@@ -61,6 +65,9 @@ class Chat:
     title: str
     created_at: float
     updated_at: float
+    # None means "use the session's configured default model" — the model
+    # selector's own choice for this chat, if the user ever picked one.
+    model: str | None = None
 
 
 class NotFound(ValueError):
@@ -76,7 +83,23 @@ class ProjectStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        # CREATE TABLE IF NOT EXISTS doesn't add a column to a table that
+        # already existed before this one was added (a real, pre-existing
+        # chats.db from before the model selector) — add it by hand, once.
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(chats)")}
+        if "model" not in existing:
+            self._conn.execute("ALTER TABLE chats ADD COLUMN model TEXT")
         self._conn.commit()
+        # Real bug, caught live in accounts.py's identical pattern (see its
+        # own comment): this one shared sqlite3.Connection is genuinely
+        # used from multiple threads at once, since most of these methods
+        # run inside route handlers FastAPI resolves via a thread pool.
+        # check_same_thread=False alone doesn't make that safe. RLock, not
+        # a plain Lock: several methods here call another locking method on
+        # `self` while already holding the lock (delete_project calling
+        # get_project, create_chat calling get_project, and so on) — a
+        # plain Lock would deadlock on that first nested call.
+        self._lock = threading.RLock()
 
     # --- projects -----------------------------------------------------
 
@@ -84,91 +107,112 @@ class ProjectStore:
         name = name.strip() or "Untitled project"
         project_id = uuid.uuid4().hex[:12]
         now = time.time()
-        self._conn.execute(
-            "INSERT INTO projects (id, user_id, name, created_at) VALUES (?, ?, ?, ?)",
-            (project_id, user_id, name, now),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO projects (id, user_id, name, created_at) VALUES (?, ?, ?, ?)",
+                (project_id, user_id, name, now),
+            )
+            self._conn.commit()
         return Project(id=project_id, user_id=user_id, name=name, created_at=now)
 
     def list_projects(self, user_id: str) -> list[Project]:
-        rows = self._conn.execute(
-            "SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC", (user_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC", (user_id,)
+            ).fetchall()
         return [Project(**dict(r)) for r in rows]
 
     def get_project(self, project_id: str, user_id: str) -> Project:
-        row = self._conn.execute(
-            "SELECT * FROM projects WHERE id = ? AND user_id = ?", (project_id, user_id)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM projects WHERE id = ? AND user_id = ?", (project_id, user_id)
+            ).fetchone()
         if row is None:
             raise NotFound(f"No project {project_id!r} for this user.")
         return Project(**dict(row))
 
     def delete_project(self, project_id: str, user_id: str) -> None:
-        self.get_project(project_id, user_id)  # raises NotFound if not this user's
-        self._conn.execute("DELETE FROM chats WHERE project_id = ? AND user_id = ?", (project_id, user_id))
-        self._conn.execute("DELETE FROM projects WHERE id = ? AND user_id = ?", (project_id, user_id))
-        self._conn.commit()
+        with self._lock:
+            self.get_project(project_id, user_id)  # raises NotFound if not this user's
+            self._conn.execute("DELETE FROM chats WHERE project_id = ? AND user_id = ?", (project_id, user_id))
+            self._conn.execute("DELETE FROM projects WHERE id = ? AND user_id = ?", (project_id, user_id))
+            self._conn.commit()
 
     # --- chats ----------------------------------------------------------
 
     def create_chat(self, project_id: str, user_id: str, title: str = "New chat") -> Chat:
-        self.get_project(project_id, user_id)  # raises NotFound if not this user's project
         chat_id = uuid.uuid4().hex[:12]
         now = time.time()
-        self._conn.execute(
-            "INSERT INTO chats (id, project_id, user_id, title, messages_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, '[]', ?, ?)",
-            (chat_id, project_id, user_id, title.strip() or "New chat", now, now),
-        )
-        self._conn.commit()
+        with self._lock:
+            self.get_project(project_id, user_id)  # raises NotFound if not this user's project
+            self._conn.execute(
+                "INSERT INTO chats (id, project_id, user_id, title, messages_json, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, '[]', ?, ?)",
+                (chat_id, project_id, user_id, title.strip() or "New chat", now, now),
+            )
+            self._conn.commit()
         return Chat(id=chat_id, project_id=project_id, user_id=user_id,
-                    title=title.strip() or "New chat", created_at=now, updated_at=now)
+                    title=title.strip() or "New chat", created_at=now, updated_at=now, model=None)
 
     def list_chats(self, project_id: str, user_id: str) -> list[Chat]:
-        self.get_project(project_id, user_id)
-        rows = self._conn.execute(
-            "SELECT id, project_id, user_id, title, created_at, updated_at FROM chats "
-            "WHERE project_id = ? AND user_id = ? ORDER BY updated_at DESC",
-            (project_id, user_id),
-        ).fetchall()
+        with self._lock:
+            self.get_project(project_id, user_id)
+            rows = self._conn.execute(
+                f"SELECT {_CHAT_COLUMNS} FROM chats "
+                "WHERE project_id = ? AND user_id = ? ORDER BY updated_at DESC",
+                (project_id, user_id),
+            ).fetchall()
         return [Chat(**dict(r)) for r in rows]
 
     def get_chat(self, chat_id: str, user_id: str) -> Chat:
-        row = self._conn.execute(
-            "SELECT id, project_id, user_id, title, created_at, updated_at FROM chats "
-            "WHERE id = ? AND user_id = ?", (chat_id, user_id),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {_CHAT_COLUMNS} FROM chats WHERE id = ? AND user_id = ?", (chat_id, user_id),
+            ).fetchone()
         if row is None:
             raise NotFound(f"No chat {chat_id!r} for this user.")
         return Chat(**dict(row))
 
+    def set_chat_model(self, chat_id: str, user_id: str, model: str | None) -> None:
+        """None clears the override, reverting the chat to the session's
+        configured default model."""
+        with self._lock:
+            self.get_chat(chat_id, user_id)
+            self._conn.execute(
+                "UPDATE chats SET model = ?, updated_at = ? WHERE id = ?",
+                (model, time.time(), chat_id),
+            )
+            self._conn.commit()
+
     def load_messages(self, chat_id: str, user_id: str) -> list[dict[str, Any]]:
-        self.get_chat(chat_id, user_id)
-        row = self._conn.execute("SELECT messages_json FROM chats WHERE id = ?", (chat_id,)).fetchone()
+        with self._lock:
+            self.get_chat(chat_id, user_id)
+            row = self._conn.execute("SELECT messages_json FROM chats WHERE id = ?", (chat_id,)).fetchone()
         return json.loads(row["messages_json"])
 
     def save_messages(self, chat_id: str, user_id: str, messages: list[dict[str, Any]]) -> None:
-        self.get_chat(chat_id, user_id)  # keeps the write authorization-checked too
-        self._conn.execute(
-            "UPDATE chats SET messages_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(messages, default=str), time.time(), chat_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            self.get_chat(chat_id, user_id)  # keeps the write authorization-checked too
+            self._conn.execute(
+                "UPDATE chats SET messages_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(messages, default=str), time.time(), chat_id),
+            )
+            self._conn.commit()
 
     def rename_chat(self, chat_id: str, user_id: str, title: str) -> None:
-        self.get_chat(chat_id, user_id)
-        self._conn.execute(
-            "UPDATE chats SET title = ?, updated_at = ? WHERE id = ?",
-            (title.strip() or "New chat", time.time(), chat_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            self.get_chat(chat_id, user_id)
+            self._conn.execute(
+                "UPDATE chats SET title = ?, updated_at = ? WHERE id = ?",
+                (title.strip() or "New chat", time.time(), chat_id),
+            )
+            self._conn.commit()
 
     def delete_chat(self, chat_id: str, user_id: str) -> None:
-        self.get_chat(chat_id, user_id)
-        self._conn.execute("DELETE FROM chats WHERE id = ? AND user_id = ?", (chat_id, user_id))
-        self._conn.commit()
+        with self._lock:
+            self.get_chat(chat_id, user_id)
+            self._conn.execute("DELETE FROM chats WHERE id = ? AND user_id = ?", (chat_id, user_id))
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()

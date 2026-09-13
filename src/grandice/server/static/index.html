@@ -4,7 +4,15 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>grandice</title>
-  <link rel="stylesheet" href="style.css" />
+  <!-- ?v= is a manual cache-bust — belt-and-suspenders alongside server/
+       app.py's NoCacheStaticFiles (Cache-Control: no-store): a real bug hit
+       live while developing this file further, where a browser's own
+       heuristic disk cache kept serving a much older style.css/app.js with
+       no network request at all, from before that header even existed, and
+       so never even saw it. A version query string is a different cache
+       key outright, not dependent on any intermediary honoring a header —
+       bump it whenever style.css/app.js actually change. -->
+  <link rel="stylesheet" href="style.css?v=2" />
 </head>
 <body>
   <div id="auth-screen" class="auth-screen">
@@ -31,6 +39,9 @@
       </div>
       <div class="topbar-right">
         <div id="badge-row" class="badge-row"></div>
+        <select id="model-select" class="model-select" disabled title="Model for this chat">
+          <option value="">model…</option>
+        </select>
         <span id="whoami" class="whoami"></span>
         <button id="logout-btn">Log out</button>
       </div>
@@ -59,11 +70,20 @@
         <div id="log" class="log"></div>
         <div id="no-chat-notice" class="muted no-chat-notice hidden">Select or create a chat to get started.</div>
         <div id="task-error" class="auth-error hidden"></div>
+        <div id="drop-overlay" class="drop-overlay hidden">Drop to attach</div>
+        <div id="attachment-chips" class="attachment-chips hidden"></div>
         <form id="task-form" class="task-form">
           <textarea id="task-input" placeholder="Give it a task…" rows="2" disabled></textarea>
+          <input type="file" id="file-input" multiple hidden />
           <div class="task-buttons">
-            <button type="submit" id="send-btn" disabled>Send</button>
-            <button type="button" id="cancel-btn" disabled>Cancel</button>
+            <div class="task-buttons-left">
+              <button type="button" id="attach-btn" class="icon-btn" title="Attach files" disabled>📎</button>
+              <button type="button" id="mic-btn" class="icon-btn" title="Voice input" disabled>🎤</button>
+            </div>
+            <div class="task-buttons-right">
+              <button type="submit" id="send-btn" disabled>Send</button>
+              <button type="button" id="cancel-btn" disabled>Cancel</button>
+            </div>
           </div>
         </form>
       </section>
@@ -153,6 +173,11 @@
     </div>
   </div>
 
-  <script src="app.js"></script>
+  <!-- Vendored, not npm-installed — matches the rest of the dashboard's
+       no-build-step approach. marked renders assistant markdown; DOMPurify
+       sanitizes it first, since that text ultimately comes from a model. -->
+  <script src="vendor/marked.min.js"></script>
+  <script src="vendor/purify.min.js"></script>
+  <script src="app.js?v=2"></script>
 </body>
 </html>

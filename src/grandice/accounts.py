@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -85,6 +86,18 @@ class AccountStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Real bug, caught live: FastAPI resolves the `current_user`
+        # dependency (which calls resolve_session on every authenticated
+        # request) via a thread pool, so this one shared sqlite3.Connection
+        # is genuinely accessed from multiple threads at once —
+        # check_same_thread=False only disables Python's own same-thread
+        # check, it does not make concurrent use of one connection safe.
+        # Confirmed directly: enough concurrent requests produced both a
+        # TypeError (expires_at read back as None) and a raw
+        # sqlite3.InterfaceError, from two threads' queries interleaving on
+        # the same connection/cursor state. A single lock around every
+        # query serializes access without needing a connection per thread.
+        self._lock = threading.Lock()
 
     def register(self, username: str, password: str) -> User:
         username = username.strip()
@@ -92,23 +105,25 @@ class AccountStore:
             raise ValueError("Username must not be empty.")
         if len(password) < MIN_PASSWORD_LENGTH:
             raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
-        if self._conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
-            raise UsernameTaken(f"{username!r} is already taken.")
+        with self._lock:
+            if self._conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+                raise UsernameTaken(f"{username!r} is already taken.")
 
-        user_id = uuid.uuid4().hex[:12]
-        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
-        now = time.time()
-        self._conn.execute(
-            "INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
-            (user_id, username, password_hash, now),
-        )
-        self._conn.commit()
+            user_id = uuid.uuid4().hex[:12]
+            password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+            now = time.time()
+            self._conn.execute(
+                "INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, username, password_hash, now),
+            )
+            self._conn.commit()
         return User(id=user_id, username=username, created_at=now)
 
     def authenticate(self, username: str, password: str) -> User:
-        row = self._conn.execute(
-            "SELECT * FROM users WHERE username = ?", (username.strip(),)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM users WHERE username = ?", (username.strip(),)
+            ).fetchone()
         if row is None or not bcrypt.checkpw(password.encode(), row["password_hash"]):
             raise InvalidCredentials("Incorrect username or password.")
         return User(id=row["id"], username=row["username"], created_at=row["created_at"])
@@ -118,27 +133,30 @@ class AccountStore:
         outside the client's cookie; only its hash is ever stored."""
         token = secrets.token_urlsafe(32)
         now = time.time()
-        self._conn.execute(
-            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (_hash_token(token), user_id, now, now + SESSION_LIFETIME_SECONDS),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (_hash_token(token), user_id, now, now + SESSION_LIFETIME_SECONDS),
+            )
+            self._conn.commit()
         return token
 
     def resolve_session(self, token: str) -> User | None:
-        row = self._conn.execute(
-            "SELECT sessions.user_id, sessions.expires_at, users.username, users.created_at "
-            "FROM sessions JOIN users ON sessions.user_id = users.id "
-            "WHERE sessions.token_hash = ?",
-            (_hash_token(token),),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT sessions.user_id, sessions.expires_at, users.username, users.created_at "
+                "FROM sessions JOIN users ON sessions.user_id = users.id "
+                "WHERE sessions.token_hash = ?",
+                (_hash_token(token),),
+            ).fetchone()
         if row is None or row["expires_at"] < time.time():
             return None
         return User(id=row["user_id"], username=row["username"], created_at=row["created_at"])
 
     def delete_session(self, token: str) -> None:
-        self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (_hash_token(token),))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (_hash_token(token),))
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()

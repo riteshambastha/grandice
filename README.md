@@ -53,7 +53,7 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 188 tests
+.venv/bin/pytest -q                        # 233 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
@@ -174,6 +174,35 @@ itself after 5 minutes rather than hanging the turn forever.
 **Background tasks, live.** `spawn_background` (§P4) runs outside the SSE
 broadcaster entirely — a lightweight poller (every 2s) is what makes a task's
 completion show up without a manual refresh.
+
+**Rich chat.** Modeled after the Claude cowork/chat experience:
+
+- **Model selector** — a dropdown in the topbar, populated by actually
+  asking the provider (`GET /v1/models` via `Router.list_models()`), not a
+  hardcoded guess; falls back to the configured tiers if the provider
+  doesn't support that endpoint. A choice persists as that chat's own
+  default (`projects.py`'s `chats.model` column) and survives a reload;
+  different chats can run different models at once.
+- **File attachments** — attach via the 📎 button or drag-and-drop
+  anywhere onto the chat. Every upload lands in that chat's own
+  `workspace/uploads/` (server/app.py's `/upload` route, filename
+  sanitized against path traversal), so `read`/`glob` can reach it like any
+  other workspace file; an image is *also* embedded directly into the
+  message as a real `image_url` content part (see `loop.py`'s
+  `_build_message_content`), for a model that actually has vision.
+- **Voice input** — the 🎤 button uses the browser's own
+  `SpeechRecognition` API for dictation into the message box. No server
+  round-trip, no model call. Chrome/Edge only (Firefox/Safari don't
+  implement it); the button disables itself with an explanatory title
+  where it isn't supported, rather than pretending to work.
+- **Markdown rendering** — assistant replies render through `marked`
+  (vendored, not npm-installed — `server/static/vendor/`) and are
+  sanitized through `DOMPurify` before hitting the DOM, since that text
+  ultimately comes from a model; verified directly that a `<script>`/
+  `onerror` injection attempt gets stripped while real formatting survives.
+
+None of this touches the plain `grandice` CLI or the underlying loop/tool
+architecture — it's additive to the dashboard's existing chat surface.
 
 This is not the full P5 client the build spec describes to the letter — no
 multi-file tree-wide diff view (one file's diff at a time, as it happens, is
@@ -392,6 +421,18 @@ the agent to ignore its instructions. It must summarise the file, not obey it.
 
 ## Known limits
 
+- Voice input needs the browser's own `SpeechRecognition` API — Chrome/Edge
+  only; the mic button disables itself elsewhere rather than pretending to
+  work. No server-side speech-to-text fallback.
+- Uploaded attachments have no automatic cleanup — they sit in that chat's
+  `workspace/uploads/` indefinitely, the same as any other workspace file.
+- `AccountStore`/`ProjectStore` each guard their one shared SQLite
+  connection with a single lock (a real bug, found live: concurrent
+  requests without one produced both a `TypeError` and a raw
+  `sqlite3.InterfaceError` from two threads' queries interleaving) — this
+  serializes correctness, not throughput; a small team's actual request
+  volume is nowhere near where that would matter, but it's not built for
+  heavy concurrent write load.
 - `sandbox-exec` (macOS) is a deprecated Apple API, weak against a determined
   escape; the Docker backend (Linux/EC2) is the same trust level, containers
   rather than a seatbelt profile. Neither is Firecracker-grade isolation.

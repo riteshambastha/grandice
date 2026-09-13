@@ -98,6 +98,16 @@ def test_index_serves_the_dashboard(client):
     assert "grandice" in res.text.lower()
 
 
+def test_static_files_are_served_no_store(client):
+    """Real bug found live: a browser could keep serving a stale app.js/
+    style.css for a while after a real change on disk, with no request ever
+    reaching the server to reveal it — no-cache (revalidate) alone turned
+    out not to be a strong enough guarantee in practice; no-store is."""
+    for path in ["/", "/app.js", "/style.css"]:
+        res = client.get(path)
+        assert res.headers["cache-control"] == "no-store", path
+
+
 # --- auth --------------------------------------------------------------------
 
 def test_register_logs_you_in(client):
@@ -196,6 +206,38 @@ def test_rename_chat(client):
     assert res.json()["title"] == "renamed"
 
 
+def test_new_chat_has_no_model_override(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    assert client.get(f"/api/chats/{chat_id}/state")  # touch the runtime
+    chat = client.patch(f"/api/chats/{chat_id}", json={"title": "chat 1"}).json()
+    assert chat["model"] is None
+
+
+def test_set_chat_model(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    res = client.patch(f"/api/chats/{chat_id}", json={"model": "code"})
+    assert res.status_code == 200
+    assert res.json()["model"] == "code"
+
+
+def test_setting_the_model_does_not_touch_the_title(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    client.patch(f"/api/chats/{chat_id}", json={"title": "renamed"})
+    res = client.patch(f"/api/chats/{chat_id}", json={"model": "code"})
+    assert res.json()["title"] == "renamed"
+
+
+def test_clearing_the_model_with_an_empty_string(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    client.patch(f"/api/chats/{chat_id}", json={"model": "code"})
+    res = client.patch(f"/api/chats/{chat_id}", json={"model": ""})
+    assert res.json()["model"] is None
+
+
 def test_delete_chat(client):
     _register(client)
     project_id, chat_id = _project_and_chat(client)
@@ -244,6 +286,107 @@ def test_different_projects_get_different_workspaces(client):
     ws2 = grandice_state.runtimes[c2].session.sandbox.workspace
     assert ws1 != ws2
     assert p1 in str(ws1) and p2 not in str(ws1)
+
+
+# --- models (§ model selector) ---------------------------------------
+
+def test_chat_models_falls_back_to_configured_tiers_in_stub_mode(client):
+    from grandice.config import Tiers
+
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    body = client.get(f"/api/chats/{chat_id}/models").json()
+    assert body["current"] is None  # no override set yet
+    assert set(body["models"]) == {Tiers.orchestrator, Tiers.worker, Tiers.bulk}
+
+
+def test_chat_models_reports_the_chats_current_override(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    client.patch(f"/api/chats/{chat_id}", json={"model": "code"})
+    body = client.get(f"/api/chats/{chat_id}/models").json()
+    assert body["current"] == "code"
+
+
+# --- file uploads (§ attachments) --------------------------------------
+
+def test_upload_saves_the_file_into_the_workspace(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    res = client.post(
+        f"/api/chats/{chat_id}/upload",
+        files={"file": ("notes.txt", b"hello world", "text/plain")},
+    )
+    assert res.status_code == 201
+    body = res.json()
+    assert body["path"] == "uploads/notes.txt"
+    assert body["name"] == "notes.txt"
+    assert body["size"] == len(b"hello world")
+
+    file_body = client.get(f"/api/chats/{chat_id}/file_content", params={"path": "uploads/notes.txt"}).json()
+    assert file_body["content"] == "hello world"
+
+
+def test_upload_sanitizes_a_path_traversal_filename(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    res = client.post(
+        f"/api/chats/{chat_id}/upload",
+        files={"file": ("../../etc/passwd", b"nope", "text/plain")},
+    )
+    assert res.status_code == 201
+    # The traversal is stripped down to just the filename component, then
+    # sanitized to a safe charset — it must land inside uploads/, never
+    # escape the workspace.
+    assert res.json()["path"].startswith("uploads/")
+    assert ".." not in res.json()["path"]
+
+
+def test_upload_avoids_overwriting_an_existing_file_with_the_same_name(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    first = client.post(
+        f"/api/chats/{chat_id}/upload", files={"file": ("a.txt", b"first", "text/plain")}
+    ).json()
+    second = client.post(
+        f"/api/chats/{chat_id}/upload", files={"file": ("a.txt", b"second", "text/plain")}
+    ).json()
+    assert first["path"] != second["path"]
+    assert client.get(f"/api/chats/{chat_id}/file_content", params={"path": first["path"]}).json()["content"] == "first"
+    assert client.get(f"/api/chats/{chat_id}/file_content", params={"path": second["path"]}).json()["content"] == "second"
+
+
+def test_upload_rejects_a_file_over_the_size_limit(client, monkeypatch):
+    import grandice.server.app as server_app_mod
+
+    monkeypatch.setattr(server_app_mod, "MAX_UPLOAD_BYTES", 10)
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    res = client.post(
+        f"/api/chats/{chat_id}/upload",
+        files={"file": ("big.txt", b"x" * 100, "text/plain")},
+    )
+    assert res.status_code == 413
+
+
+def test_task_with_an_attachment_mentions_it_in_the_stored_message(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    upload = client.post(
+        f"/api/chats/{chat_id}/upload", files={"file": ("notes.txt", b"hi", "text/plain")}
+    ).json()
+
+    res = client.post(f"/api/chats/{chat_id}/task", json={"message": "see attached", "attachments": [upload["path"]]})
+    assert res.status_code == 202
+
+    for _ in range(50):
+        if not client.get(f"/api/chats/{chat_id}/state").json()["running"]:
+            break
+        time.sleep(0.02)
+
+    grandice_state = client.app.state.grandice
+    messages = grandice_state.runtimes[chat_id].session.messages
+    assert "notes.txt" in messages[0]["content"]
 
 
 def test_files_lists_the_workspace_root(client):

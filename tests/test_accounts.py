@@ -108,3 +108,37 @@ def test_resolve_session_rejects_an_expired_token(store: AccountStore, monkeypat
 
     time.sleep(0.1)
     assert store.resolve_session(token) is None
+
+
+# --- concurrency: FastAPI resolves current_user via a thread pool, so this
+# one shared sqlite3.Connection genuinely gets hit from multiple threads at
+# once on every real request, not just hypothetically -----------------------
+
+def test_resolve_session_survives_real_concurrent_access(store: AccountStore):
+    """Real bug, caught live: enough concurrent resolve_session() calls on
+    one connection (no lock) produced both a TypeError (expires_at read
+    back as None) and a raw sqlite3.InterfaceError, from two threads'
+    queries interleaving on the same connection/cursor state."""
+    import threading
+
+    user = store.register("alice", "correct horse")
+    token = store.create_session(user.id)
+
+    errors: list[BaseException] = []
+    results: list[object] = []
+
+    def worker():
+        try:
+            results.append(store.resolve_session(token))
+        except BaseException as exc:  # noqa: BLE001 — a thread swallowing this would hide the bug
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert len(results) == 50
+    assert all(r is not None and r.id == user.id for r in results)

@@ -386,19 +386,27 @@ class Router:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[str | Reply]:
-        """Yields text deltas, then exactly one Reply as the final item."""
+        """Yields text deltas, then exactly one Reply as the final item.
+
+        `model` overrides the tier's configured model id for just this call
+        — the dashboard's model selector (§ chat.model in projects.py) uses
+        this to let a chat pick any model/alias the provider actually
+        exposes, rather than being locked to whatever GRANDICE_ORCHESTRATOR
+        happens to be. `tier` still governs cost-ledger pricing either way.
+        """
         self.ledger.check()
         if self.rate_limiter is not None:
             await self.rate_limiter.acquire()  # may raise DailyCapReached
 
-        model = self.model_for(tier)
+        resolved_model = model or self.model_for(tier)
         temp = self.config.temperature if temperature is None else temperature
 
         last_error: Exception | None = None
         for backend in self.backends:
             try:
-                async for item in backend.complete(model, messages, tools or [], temp):
+                async for item in backend.complete(resolved_model, messages, tools or [], temp):
                     if isinstance(item, Reply):
                         self.ledger.record(tier, item.prompt_tokens, item.completion_tokens)
                     yield item
@@ -436,3 +444,28 @@ class Router:
         )
         response = await client.embeddings.create(model=self.config.embedding_model, input=texts)
         return [item.embedding for item in response.data]
+
+    async def list_models(self) -> list[str]:
+        """The provider's own model/alias list (GET /v1/models) — lets the
+        dashboard's model selector show whatever a given gateway actually
+        exposes (e.g. a self-hosted box's "chat"/"code"/"vision" aliases)
+        rather than a hardcoded guess. Falls back to just the configured
+        tiers if the provider doesn't support the endpoint or isn't live —
+        the selector should never come up empty."""
+        fallback = sorted({self.config.tiers.orchestrator, self.config.tiers.worker, self.config.tiers.bulk})
+        if not self.config.live:
+            return fallback
+
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
+            timeout=self.config.llm_timeout_seconds,
+        )
+        try:
+            response = await client.models.list()
+            ids = sorted({m.id for m in response.data})
+            return ids or fallback
+        except Exception:  # noqa: BLE001 — a broken /models endpoint shouldn't break the selector
+            return fallback

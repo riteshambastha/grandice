@@ -7,10 +7,13 @@ tools stop for a human. Results are truncated on the way in, not the way out.
 
 from __future__ import annotations
 
+import base64
 import difflib
+import mimetypes
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from . import context
@@ -26,6 +29,15 @@ REFLECT_AFTER = 2  # consecutive failures on one tool before a forced rethink
 # covered; the diff view is best-effort, not a filesystem watcher.
 _FILE_WRITING_TOOLS = {"write", "edit"}
 DIFF_CHAR_LIMIT = 4_000  # same truncate-on-the-way-in spirit as §05.4
+
+# Attachments (§ dashboard file upload): an image is embedded directly into
+# the user message as a real vision content part, not just mentioned by
+# path — a model without vision support just ignores an image_url part it
+# doesn't understand, so this is safe either way. Anything else (docs,
+# text, code) is left for the model to reach with `read`/`glob`, same as
+# any other workspace file; only the path is mentioned in the message.
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024  # a generous but bounded inline-image size
 
 
 @dataclass
@@ -63,7 +75,11 @@ Event = TextDelta | ToolStarted | ToolFinished | FileChanged | Finished
 
 
 async def run_turn(
-    session: Session, user_message: str, tier: str = "orchestrator"
+    session: Session,
+    user_message: str,
+    tier: str = "orchestrator",
+    model: str | None = None,
+    attachments: list[str] | None = None,
 ) -> AsyncIterator[Event]:
     """One user message to completion. Yields events for the client to render.
 
@@ -72,10 +88,15 @@ async def run_turn(
     the orchestrator's own reasoning budget. The router instance is shared
     with the parent session regardless of tier, so the cost ledger and rate
     limiter aggregate correctly across a session and any subagents it spawns.
+
+    `model` overrides the tier's configured model id for this turn (the
+    dashboard's model selector). `attachments` are workspace-relative paths
+    to files already uploaded into the sandbox — see `_build_message_content`.
     """
-    session.messages.append({"role": "user", "content": user_message})
+    content = _build_message_content(session, user_message, attachments or [])
+    session.messages.append({"role": "user", "content": content})
     session.turns += 1
-    session.log("user", content=user_message)
+    session.log("user", content=user_message, attachments=attachments or [])
 
     reason = "done"
 
@@ -91,6 +112,7 @@ async def run_turn(
                 tier=tier,
                 messages=context.assemble(session),
                 tools=context.active_tools(session),
+                model=model,
             ):
                 if isinstance(item, str):
                     yield TextDelta(item)
@@ -254,3 +276,43 @@ def _reflection(tool: str) -> dict[str, Any]:
 def _preview(content: str, width: int = 160) -> str:
     flat = " ".join(content.split())
     return flat[:width] + ("…" if len(flat) > width else "")
+
+
+def _build_message_content(
+    session: Session, text: str, attachment_paths: list[str]
+) -> str | list[dict[str, Any]]:
+    """Plain string when there are no attachments — unchanged shape from
+    before attachments existed, so every other message in the transcript
+    still looks exactly as it always has. With attachments, every uploaded
+    file is named in the text (so `read`/`glob` can reach it like any other
+    workspace file), and any image among them is *also* embedded as a real
+    `image_url` content part, for a model that actually has vision."""
+    if not attachment_paths:
+        return text
+
+    image_parts: list[dict[str, Any]] = []
+    lines: list[str] = []
+    for rel_path in attachment_paths:
+        lines.append(f"- {rel_path}")
+        if Path(rel_path).suffix.lower() not in _IMAGE_EXTENSIONS:
+            continue
+        try:
+            target = session.sandbox.resolve(rel_path)
+            data = target.read_bytes()
+        except Exception:  # noqa: BLE001 — best-effort; the path mention below still works
+            continue
+        if len(data) > MAX_INLINE_IMAGE_BYTES:
+            continue
+        mime = mimetypes.guess_type(rel_path)[0] or "image/png"
+        image_parts.append(
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}}
+        )
+
+    annotated = (
+        f"{text}\n\n[Attached file(s) — also readable from the workspace via `read`/`glob`:\n"
+        + "\n".join(lines)
+        + "\n]"
+    )
+    if not image_parts:
+        return annotated
+    return [{"type": "text", "text": annotated}, *image_parts]

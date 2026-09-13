@@ -300,3 +300,91 @@ async def test_embed_calls_the_configured_base_url_and_model(monkeypatch):
     assert captured["model"] == "embed"
     assert captured["input"] == ["a", "b"]
     assert vectors == [[0.1, 0.2], [0.1, 0.2]]
+
+
+# --- Router.complete(model=...) — a per-call override of the tier's model --
+
+async def test_complete_uses_the_tiers_model_by_default(monkeypatch):
+    config = replace(Config.from_env(), api_key="k", base_url="https://example.invalid")
+    captured = {}
+
+    class _Capture(Backend):
+        name = "capture"
+
+        async def complete(self, model, messages, tools, temperature):
+            captured["model"] = model
+            yield Reply(text="ok")
+
+    router = Router(config, backends=[_Capture()], rate_limiter=None)
+    async for _ in router.complete(tier="orchestrator", messages=[]):
+        pass
+    assert captured["model"] == config.tiers.orchestrator
+
+
+async def test_complete_model_override_wins_over_the_tier(monkeypatch):
+    config = replace(Config.from_env(), api_key="k", base_url="https://example.invalid")
+    captured = {}
+
+    class _Capture(Backend):
+        name = "capture"
+
+        async def complete(self, model, messages, tools, temperature):
+            captured["model"] = model
+            yield Reply(text="ok")
+
+    router = Router(config, backends=[_Capture()], rate_limiter=None)
+    async for _ in router.complete(tier="orchestrator", messages=[], model="a-custom-alias"):
+        pass
+    assert captured["model"] == "a-custom-alias"
+
+
+# --- Router.list_models() ---------------------------------------------
+
+async def test_list_models_returns_tier_ids_when_not_live():
+    config = replace(Config.from_env(), api_key=None, base_url=None)
+    router = Router(config)
+    models = await router.list_models()
+    assert set(models) == {config.tiers.orchestrator, config.tiers.worker, config.tiers.bulk}
+
+
+async def test_list_models_queries_the_provider_when_live(monkeypatch):
+    config = replace(Config.from_env(), api_key="k", base_url="https://example.invalid")
+    router = Router(config, backends=[StubBackend()], rate_limiter=None)
+
+    class FakeModel:
+        def __init__(self, id):
+            self.id = id
+
+    class FakeModels:
+        async def list(self):
+            class Result:
+                data = [FakeModel("chat"), FakeModel("code"), FakeModel("vision")]
+
+            return Result()
+
+    class FakeClient:
+        def __init__(self, base_url, api_key, timeout):
+            self.models = FakeModels()
+
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeClient)
+
+    models = await router.list_models()
+    assert models == ["chat", "code", "vision"]
+
+
+async def test_list_models_falls_back_if_the_provider_endpoint_errors(monkeypatch):
+    config = replace(Config.from_env(), api_key="k", base_url="https://example.invalid")
+    router = Router(config, backends=[StubBackend()], rate_limiter=None)
+
+    class FakeModels:
+        async def list(self):
+            raise RuntimeError("the gateway doesn't support /v1/models")
+
+    class FakeClient:
+        def __init__(self, base_url, api_key, timeout):
+            self.models = FakeModels()
+
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeClient)
+
+    models = await router.list_models()
+    assert set(models) == {config.tiers.orchestrator, config.tiers.worker, config.tiers.bulk}

@@ -60,6 +60,13 @@ const $confirmMessage = document.getElementById("confirm-message");
 const $confirmOk = document.getElementById("confirm-ok");
 const $confirmCancel = document.getElementById("confirm-cancel");
 
+const $modelSelect = document.getElementById("model-select");
+const $fileInput = document.getElementById("file-input");
+const $attachBtn = document.getElementById("attach-btn");
+const $micBtn = document.getElementById("mic-btn");
+const $attachmentChips = document.getElementById("attachment-chips");
+const $dropOverlay = document.getElementById("drop-overlay");
+
 let authMode = "login"; // "login" | "register"
 let projects = [];
 let chats = [];
@@ -68,8 +75,12 @@ let currentChatId = null;
 let currentDir = ".";
 let openToolEntry = null; // the DOM node for the most recent unresolved tool_started
 let streamingText = null; // the DOM node currently accumulating text_delta chunks
+let streamingRawText = ""; // the raw markdown backing streamingText — rendered to HTML on every delta
 let approvalQueue = []; // {request_id, payload} — shown one at a time, oldest first
 let eventSource = null; // the current chat's SSE connection; replaced on every chat switch
+let pendingAttachments = []; // [{path, name}] — uploaded, waiting to be sent with the next message
+let recognizing = false; // whether the mic is actively listening
+let lastState = null; // the most recent /state response, so the model selector can show the real default
 
 // --- text-input / confirm dialogs --------------------------------------
 //
@@ -270,12 +281,14 @@ async function selectChat(chatId) {
   renderChatList();
   closeChatConnection();
   resetDashboard();
+  stopListening();
 
   if (!chatId) {
     $noChatNotice.classList.remove("hidden");
     setRunning(false);
     $taskInput.disabled = true;
     $sendBtn.disabled = true;
+    $modelSelect.disabled = true;
     return;
   }
   $noChatNotice.classList.add("hidden");
@@ -283,6 +296,7 @@ async function selectChat(chatId) {
 
   await refreshState();
   await refreshFiles(".");
+  await loadModels();
   // No separate GET /log call here: connect()'s SSE stream replays this
   // chat's full history itself (_stream() in app.py yields the
   // broadcaster's history before any live event) — fetching it again here
@@ -318,6 +332,7 @@ $newChatBtn.onclick = async () => {
 function resetDashboard() {
   $log.innerHTML = "";
   streamingText = null;
+  streamingRawText = "";
   openToolEntry = null;
   approvalQueue = [];
   $approvalModal.classList.add("hidden");
@@ -329,6 +344,9 @@ function resetDashboard() {
   $fileList.innerHTML = "";
   $breadcrumb.innerHTML = "";
   currentDir = ".";
+  pendingAttachments = [];
+  renderAttachmentChips();
+  $modelSelect.innerHTML = '<option value="">model…</option>';
 }
 
 function closeChatConnection() {
@@ -345,6 +363,7 @@ function planMark(status) {
 }
 
 function renderState(state) {
+  lastState = state;
   $badgeLive.textContent = state.live ? "live" : "stub";
   $badgeLive.className = "badge " + (state.live ? "live" : "stub");
 
@@ -419,12 +438,31 @@ function setRunning(running) {
   $sendBtn.disabled = running || !hasChat;
   $taskInput.disabled = running || !hasChat;
   $cancelBtn.disabled = !running || !hasChat;
+  $attachBtn.disabled = running || !hasChat;
+  $micBtn.disabled = running || !hasChat || !speechRecognitionSupported();
+  $modelSelect.disabled = !hasChat;
 }
 
 function escapeHtml(s) {
   const div = document.createElement("div");
   div.textContent = s;
   return div.innerHTML;
+}
+
+function renderMarkdownInto(el, rawText) {
+  // marked.parse() is re-run on the whole accumulated text on every delta —
+  // simplest correct approach for a streaming markdown parse (a partial
+  // fence or list mid-token briefly renders oddly, then corrects itself
+  // once the rest arrives, same as Claude's own chat). DOMPurify sanitizes
+  // the result first: this text ultimately comes from a model, and a
+  // self-hosted one is a real, more direct exception to the input-is-data
+  // rule than a hosted provider's is — never trust it to emit only safe
+  // HTML on its own.
+  if (typeof marked === "undefined" || typeof DOMPurify === "undefined") {
+    el.textContent = rawText; // vendor scripts failed to load — degrade to plain text, not a blank pane
+    return;
+  }
+  el.innerHTML = DOMPurify.sanitize(marked.parse(rawText));
 }
 
 function renderDiff(diffText) {
@@ -449,12 +487,19 @@ function appendLogNode(node) {
   if (atBottom) $log.scrollTop = $log.scrollHeight;
 }
 
-function addUserMessage(text) {
+function addUserMessage(text, attachments) {
   const div = document.createElement("div");
   div.className = "log-entry log-user";
   div.textContent = text;
+  if (attachments && attachments.length) {
+    const chips = document.createElement("div");
+    chips.className = "user-message-attachments";
+    chips.textContent = "📎 " + attachments.map((a) => a.name).join(", ");
+    div.appendChild(chips);
+  }
   appendLogNode(div);
   streamingText = null;
+  streamingRawText = "";
   openToolEntry = null;
 }
 
@@ -463,10 +508,12 @@ function handleEvent(ev) {
     case "text_delta": {
       if (!streamingText) {
         streamingText = document.createElement("div");
-        streamingText.className = "log-entry log-text";
+        streamingText.className = "log-entry log-text markdown-body";
         appendLogNode(streamingText);
+        streamingRawText = "";
       }
-      streamingText.textContent += ev.text;
+      streamingRawText += ev.text;
+      renderMarkdownInto(streamingText, streamingRawText);
       $log.scrollTop = $log.scrollHeight;
       break;
     }
@@ -478,6 +525,7 @@ function handleEvent(ev) {
       appendLogNode(div);
       openToolEntry = div;
       streamingText = null;
+      streamingRawText = "";
       break;
     }
     case "tool_finished": {
@@ -510,6 +558,7 @@ function handleEvent(ev) {
       div.textContent = `${ev.reason} · ${ev.steps} steps · ~$${ev.cost_usd.toFixed(3)}`;
       appendLogNode(div);
       streamingText = null;
+      streamingRawText = "";
       openToolEntry = null;
       setRunning(false);
       refreshState();
@@ -578,6 +627,46 @@ async function openFile(path) {
 $modalClose.onclick = () => $modal.classList.add("hidden");
 $modal.onclick = (e) => { if (e.target === $modal) $modal.classList.add("hidden"); };
 
+// --- model selector ------------------------------------------------------
+//
+// GET /api/chats/{id}/models asks the *provider itself* what it exposes
+// (falling back to the configured tiers if that fails or isn't live) —
+// so this reflects whatever a given gateway actually offers, not a
+// hardcoded guess. Selecting one persists as this chat's own default via
+// PATCH; it stays in effect (including after a reload) until changed again.
+
+async function loadModels() {
+  if (!currentChatId) return;
+  const res = await fetch(`/api/chats/${currentChatId}/models`);
+  if (!res.ok) return;
+  const data = await res.json();
+
+  $modelSelect.innerHTML = "";
+  for (const id of data.models) {
+    const opt = document.createElement("option");
+    opt.value = id;
+    opt.textContent = id;
+    $modelSelect.appendChild(opt);
+  }
+  // No explicit override yet: show what's actually in effect (the
+  // orchestrator tier's own default), not just whichever option happens to
+  // come first — the dropdown should never silently misrepresent reality.
+  const shown = data.current || lastState?.model?.orchestrator;
+  if (shown && data.models.includes(shown)) {
+    $modelSelect.value = shown;
+  }
+  $modelSelect.disabled = false;
+}
+
+$modelSelect.onchange = async () => {
+  if (!currentChatId) return;
+  await fetch(`/api/chats/${currentChatId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: $modelSelect.value }),
+  });
+};
+
 // --- approvals (§P5) ------------------------------------------------------
 //
 // An outward-facing tool (currently only `fetch`) blocks mid-turn waiting on
@@ -609,6 +698,135 @@ async function resolveApproval(approved) {
 $approvalApprove.onclick = () => resolveApproval(true);
 $approvalDeny.onclick = () => resolveApproval(false);
 
+// --- attachments -----------------------------------------------------------
+//
+// A file is uploaded immediately on selection (not deferred to send-time) —
+// it lands in the chat's own workspace under uploads/, exactly like any
+// other workspace file, so `read`/`glob` can reach it the same way. Only
+// its path is kept client-side (in pendingAttachments) until the message
+// is actually sent.
+
+$attachBtn.onclick = () => $fileInput.click();
+
+$fileInput.onchange = async () => {
+  const files = [...$fileInput.files];
+  $fileInput.value = ""; // so picking the same file again still fires onchange
+  for (const file of files) await uploadFile(file);
+};
+
+async function uploadFile(file) {
+  if (!currentChatId) return;
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetch(`/api/chats/${currentChatId}/upload`, { method: "POST", body: formData });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    $taskError.textContent = body.detail || `Could not upload ${file.name}.`;
+    $taskError.classList.remove("hidden");
+    setTimeout(() => $taskError.classList.add("hidden"), 4000);
+    return;
+  }
+  const uploaded = await res.json();
+  pendingAttachments.push(uploaded);
+  renderAttachmentChips();
+}
+
+function renderAttachmentChips() {
+  $attachmentChips.classList.toggle("hidden", pendingAttachments.length === 0);
+  $attachmentChips.innerHTML = pendingAttachments
+    .map(
+      (a, i) => `<span class="attachment-chip">📎 ${escapeHtml(a.name)}<button type="button" data-i="${i}" title="Remove">×</button></span>`
+    )
+    .join("");
+  for (const btn of $attachmentChips.querySelectorAll("button")) {
+    btn.onclick = () => {
+      pendingAttachments.splice(Number(btn.dataset.i), 1);
+      renderAttachmentChips();
+    };
+  }
+}
+
+// Drag-and-drop onto the whole log panel, not just the input — matches
+// the common "drop it anywhere in the chat" pattern rather than a small
+// fixed target.
+const $logPanel = $log.closest(".log-panel");
+let dragDepth = 0; // dragenter/dragleave fire on every child crossed, not just the container
+
+$logPanel.addEventListener("dragenter", (e) => {
+  e.preventDefault();
+  if (!currentChatId) return;
+  dragDepth++;
+  $dropOverlay.classList.remove("hidden");
+});
+$logPanel.addEventListener("dragover", (e) => e.preventDefault());
+$logPanel.addEventListener("dragleave", () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) $dropOverlay.classList.add("hidden");
+});
+$logPanel.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  $dropOverlay.classList.add("hidden");
+  if (!currentChatId) return;
+  for (const file of [...e.dataTransfer.files]) await uploadFile(file);
+});
+
+// --- voice input -----------------------------------------------------------
+//
+// The browser's own SpeechRecognition API — no server round-trip, no model
+// call. Chrome/Edge support it (as the vendor-prefixed webkitSpeechRecognition);
+// Firefox and Safari currently don't, so the mic button just disables itself
+// with an explanatory title rather than pretending to work.
+
+const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+let speechRecognition = null;
+
+function speechRecognitionSupported() {
+  return !!SpeechRecognitionImpl;
+}
+
+if (!speechRecognitionSupported()) {
+  $micBtn.title = "Voice input isn't supported in this browser (try Chrome or Edge).";
+}
+
+function stopListening() {
+  if (speechRecognition) speechRecognition.stop();
+}
+
+$micBtn.onclick = () => {
+  if (!speechRecognitionSupported() || !currentChatId) return;
+  if (recognizing) {
+    stopListening();
+    return;
+  }
+  speechRecognition = new SpeechRecognitionImpl();
+  speechRecognition.continuous = true;
+  speechRecognition.interimResults = true;
+  speechRecognition.lang = navigator.language || "en-US";
+
+  let finalText = $taskInput.value ? $taskInput.value + " " : "";
+
+  speechRecognition.onstart = () => {
+    recognizing = true;
+    $micBtn.classList.add("recording");
+  };
+  speechRecognition.onresult = (event) => {
+    let interim = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const transcript = event.results[i][0].transcript;
+      if (event.results[i].isFinal) finalText += transcript + " ";
+      else interim += transcript;
+    }
+    $taskInput.value = finalText + interim;
+  };
+  speechRecognition.onerror = () => stopListening();
+  speechRecognition.onend = () => {
+    recognizing = false;
+    $micBtn.classList.remove("recording");
+  };
+  speechRecognition.start();
+};
+
 // --- task form ----------------------------------------------------------
 
 $taskForm.onsubmit = async (e) => {
@@ -617,10 +835,13 @@ $taskForm.onsubmit = async (e) => {
   const message = $taskInput.value.trim();
   if (!message) return;
 
+  stopListening();
+  const attachments = pendingAttachments;
+
   const res = await fetch(`/api/chats/${currentChatId}/task`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, attachments: attachments.map((a) => a.path) }),
   });
   if (res.status === 409) {
     $taskError.textContent = (await res.json()).detail;
@@ -628,8 +849,10 @@ $taskForm.onsubmit = async (e) => {
     setTimeout(() => $taskError.classList.add("hidden"), 4000);
     return;
   }
-  addUserMessage(message);
+  addUserMessage(message, attachments);
   $taskInput.value = "";
+  pendingAttachments = [];
+  renderAttachmentChips();
   setRunning(true);
 };
 
