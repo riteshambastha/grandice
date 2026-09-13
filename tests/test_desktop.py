@@ -50,8 +50,6 @@ def test_free_port_returns_different_ports_across_calls():
 
 async def test_start_server_actually_serves_the_dashboard(tmp_path, monkeypatch):
     monkeypatch.setenv("GRANDICE_WORKSPACE", str(tmp_path / "ws"))
-    monkeypatch.delenv("GRANDICE_API_KEY", raising=False)
-    monkeypatch.delenv("GRANDICE_BASE_URL", raising=False)
 
     port = _free_port()
     server = _start_server("127.0.0.1", port)

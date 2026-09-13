@@ -166,14 +166,23 @@ class Config:
                 bulk=os.getenv("GRANDICE_BULK", Tiers.bulk),
             )
 
-        # The 18/min-50/day defaults below are OpenRouter-free-tier-specific
-        # (see .env.example) — a private, self-hosted gateway has no such
-        # limit, so defaulting to it would silently throttle a local box
-        # after 50 calls a day for no reason. Only applies when neither
-        # GRANDICE_REQUESTS_PER_MINUTE nor GRANDICE_DAILY_REQUEST_CAP is set
-        # explicitly; either can still override it either way.
-        default_rpm = "100000" if using_private_gateway else "18"
-        default_daily = "100000" if using_private_gateway else "50"
+        # The 18/min-50/day defaults are OpenRouter-free-tier-specific (see
+        # .env.example) — a private, self-hosted gateway has no such limit.
+        # Same reasoning as the tier vars above, and the same real bug this
+        # guards against: this repo's own .env has GRANDICE_REQUESTS_PER_
+        # MINUTE=18/GRANDICE_DAILY_REQUEST_CAP=50 set explicitly from the
+        # OpenRouter setup, which would otherwise silently throttle a local
+        # box that has no such limit at all — caught by actually watching
+        # the dashboard report "1 / 50 requests" against the live private
+        # gateway. So, like the tier vars, these are ignored on the private-
+        # gateway path rather than falling through to whatever the legacy
+        # path happened to have configured.
+        if using_private_gateway:
+            requests_per_minute = 100_000
+            daily_request_cap = 100_000
+        else:
+            requests_per_minute = int(os.getenv("GRANDICE_REQUESTS_PER_MINUTE", "18"))
+            daily_request_cap = int(os.getenv("GRANDICE_DAILY_REQUEST_CAP", "50"))
 
         return cls(
             base_url=base_url,
@@ -183,8 +192,8 @@ class Config:
             sandbox=os.getenv("GRANDICE_SANDBOX", default_sandbox),
             sandbox_image=os.getenv("GRANDICE_SANDBOX_IMAGE", "grandice-sandbox:py3.12"),
             cost_cap_usd=float(os.getenv("GRANDICE_COST_CAP_USD", "2.00")),
-            requests_per_minute=int(os.getenv("GRANDICE_REQUESTS_PER_MINUTE", default_rpm)),
-            daily_request_cap=int(os.getenv("GRANDICE_DAILY_REQUEST_CAP", default_daily)),
+            requests_per_minute=requests_per_minute,
+            daily_request_cap=daily_request_cap,
             mcp_connectors=tuple(
                 c.strip() for c in os.getenv("GRANDICE_MCP_CONNECTORS", "").split(",") if c.strip()
             ),

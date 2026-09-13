@@ -108,9 +108,12 @@ start; raise `GRANDICE_LLM_TIMEOUT_SECONDS` (default 60s) if that's a
 recurring problem rather than a one-off.
 
 A private box has no external rate limit the way OpenRouter's free tier
-does, so `GRANDICE_REQUESTS_PER_MINUTE`/`GRANDICE_DAILY_REQUEST_CAP` default
-much higher automatically once a private gateway is what's live — set them
-explicitly only if you actually want a cap.
+does, so `GRANDICE_REQUESTS_PER_MINUTE`/`GRANDICE_DAILY_REQUEST_CAP` are
+ignored once a private gateway is what's live, the same reasoning as
+`GRANDICE_LLM_CHAT_MODEL` above — this repo's own `.env` has both set to
+OpenRouter-tuned values that would otherwise silently throttle a box that
+has no such limit at all (caught by actually watching the dashboard report
+"1 / 50 requests" against the real gateway).
 
 ## Live view
 

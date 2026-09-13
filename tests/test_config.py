@@ -171,14 +171,19 @@ def test_private_gateway_defaults_rate_limits_much_higher_than_openrouter(monkey
     assert config.daily_request_cap > 1000
 
 
-def test_explicit_rate_limit_vars_still_override_the_private_gateway_default(monkeypatch):
+def test_legacy_rate_limit_vars_are_ignored_on_the_private_gateway_path(monkeypatch):
+    """Real bug caught by actually watching the live dashboard: this repo's
+    own .env sets GRANDICE_REQUESTS_PER_MINUTE=18/GRANDICE_DAILY_REQUEST_
+    CAP=50 explicitly (left over from the OpenRouter setup) — those must
+    not leak through and throttle a private gateway that has no such limit
+    at all, the same reasoning as the tier vars above."""
     monkeypatch.setenv("GRANDICE_LLM_BASE_URL", "https://ambeast.tail7156f0.ts.net/v1")
     monkeypatch.setenv("GRANDICE_LLM_API_KEY", "gll-private")
     monkeypatch.setenv("GRANDICE_REQUESTS_PER_MINUTE", "5")
     monkeypatch.setenv("GRANDICE_DAILY_REQUEST_CAP", "10")
     config = Config.from_env()
-    assert config.requests_per_minute == 5
-    assert config.daily_request_cap == 10
+    assert config.requests_per_minute == 100_000
+    assert config.daily_request_cap == 100_000
 
 
 def test_legacy_openrouter_path_keeps_its_original_rate_limit_defaults(monkeypatch):

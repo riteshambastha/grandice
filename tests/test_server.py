@@ -23,8 +23,6 @@ from grandice import loop as agent_loop
 
 @pytest.fixture
 def app(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("GRANDICE_API_KEY", raising=False)
-    monkeypatch.delenv("GRANDICE_BASE_URL", raising=False)
     monkeypatch.setenv("GRANDICE_WORKSPACE", str(tmp_path / "unused-cli-workspace"))
     return server_app.create_app(
         accounts_path=tmp_path / "accounts.db",
@@ -464,8 +462,6 @@ def test_lifespan_starts_and_stops_a_configured_connector(tmp_path, monkeypatch)
     pytest.importorskip("mcp_server_sqlite")
 
     monkeypatch.setenv("GRANDICE_MCP_CONNECTORS", "sqlite")
-    monkeypatch.delenv("GRANDICE_API_KEY", raising=False)
-    monkeypatch.delenv("GRANDICE_BASE_URL", raising=False)
 
     app = server_app.create_app(
         accounts_path=tmp_path / "accounts.db",
