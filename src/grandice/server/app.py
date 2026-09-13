@@ -1,7 +1,14 @@
 """FastAPI + SSE live-view dashboard (§09's stack pick — "streaming without
-WebSocket complexity"). One process, one Session, any number of browser tabs
-watching it: observe the loop live, send a task, cancel one. Not the full P5
-client — see server/__init__.py for what's deliberately not here yet.
+WebSocket complexity"). Multi-user, multi-project, multi-chat: real
+accounts (accounts.py), projects each with their own workspace/sandbox
+(projects.py), any number of chats per project — each chat gets its own
+isolated ChatRuntime (Session, event broadcaster, running flag, pending
+approvals), so two chats never see each other's stream or block each
+other's task.
+
+Not the full P5 client to the letter — see server/__init__.py — and this
+is dashboard/desktop-app only; the plain `grandice` CLI stays the
+single-user, no-login tool it always was.
 """
 
 from __future__ import annotations
@@ -11,17 +18,20 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import loop as agent_loop
+from ..accounts import AccountStore, InvalidCredentials, UsernameTaken, User
 from ..config import Config
 from ..permissions import Gate
+from ..projects import Chat, NotFound, ProjectStore
 from ..session import Session, build as build_session, start_connectors, stop_connectors
 from .broadcast import Broadcaster
 from .serialize import event_to_dict
@@ -31,6 +41,29 @@ KEEPALIVE_SECONDS = 15
 FILE_PREVIEW_LIMIT = 100_000  # characters — same truncate-on-the-way-in spirit as §05.4
 APPROVAL_TIMEOUT_SECONDS = 300  # an unanswered approval denies itself rather than hanging the turn forever
 TASK_POLL_SECONDS = 2  # how often the background-task poller checks for status changes
+
+SESSION_COOKIE = "grandice_session"
+ACCOUNTS_DB_PATH = Path.home() / ".grandice" / "accounts.db"
+PROJECTS_DB_PATH = Path.home() / ".grandice" / "projects.db"
+PROJECTS_ROOT = Path.home() / "Documents" / "grandice" / "projects"
+
+
+class RegisterIn(BaseModel):
+    username: str
+    password: str
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class ProjectIn(BaseModel):
+    name: str
+
+
+class ChatIn(BaseModel):
+    title: str = "New chat"
 
 
 class TaskIn(BaseModel):
@@ -42,110 +75,213 @@ class ApproveIn(BaseModel):
     approved: bool
 
 
+@dataclass
+class ChatRuntime:
+    """Everything one open chat needs that used to be the whole AppState —
+    its own Session, its own event stream, its own running/approval state.
+    Built lazily the first time a chat is actually touched, not at login."""
+
+    session: Session
+    broadcaster: Broadcaster = field(default_factory=Broadcaster)
+    running: bool = False
+    pending_approvals: dict[str, asyncio.Future] = field(default_factory=dict)
+    # The mcp SDK's AsyncExitStack is task-bound (anyio cancel scopes must
+    # exit in the same task that entered them) — since a chat's runtime is
+    # built inside whichever request task first touches it, connectors must
+    # be opened *and closed* from one dedicated task that outlives that
+    # request, not from the request task or the lifespan's own task. `_owner`
+    # is that task; `_closing` is how _evict_runtime asks it to shut down.
+    _owner: asyncio.Task | None = field(default=None, repr=False)
+    _closing: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+
 class AppState:
-    """Shared mutable state, held on the FastAPI app rather than as module
-    globals — so create_app() can build more than one, in tests."""
-
-    def __init__(self, session: Session | None) -> None:
-        self.session = session
-        self.broadcaster = Broadcaster()
-        self.running = False
-        # request_id -> a Future the web_ask closure below is awaiting;
-        # POST /api/approve resolves it. Reusing Gate/Risk from permissions.py
-        # rather than a parallel approval mechanism — only the *asker* differs
-        # from the CLI's synchronous terminal prompt.
-        self.pending_approvals: dict[str, asyncio.Future] = {}
+    def __init__(self, base_config: Config, accounts: AccountStore, projects: ProjectStore, projects_root: Path) -> None:
+        self.base_config = base_config
+        self.accounts = accounts
+        self.projects = projects
+        self.projects_root = projects_root
+        self.runtimes: dict[str, ChatRuntime] = {}
 
 
-def create_app(session: Session | None = None) -> FastAPI:
-    state = AppState(session)
+def create_app(
+    base_config: Config | None = None,
+    accounts_path: Path | None = None,
+    projects_path: Path | None = None,
+    projects_root: Path | None = None,
+) -> FastAPI:
+    state = AppState(
+        base_config=base_config or Config.from_env(),
+        accounts=AccountStore(accounts_path or ACCOUNTS_DB_PATH),
+        projects=ProjectStore(projects_path or PROJECTS_DB_PATH),
+        projects_root=projects_root or PROJECTS_ROOT,
+    )
 
-    async def web_ask(payload: str) -> bool:
-        """The dashboard's Asker (§08/permissions.py): publish an
-        approval_needed event instead of blocking on terminal input, and
-        wait for POST /api/approve to resolve it. Times out to a denial
-        rather than hanging the turn forever if nobody answers."""
-        request_id = uuid.uuid4().hex[:12]
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
-        state.pending_approvals[request_id] = future
-        state.broadcaster.publish(
-            {"type": "approval_needed", "request_id": request_id, "payload": payload}
-        )
-        try:
-            return await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            return False
-        finally:
-            state.pending_approvals.pop(request_id, None)
-
-    if state.session is None:
-        state.session = build_session(Config.from_env(), Gate(web_ask))
+    def current_user(request: Request) -> User:
+        token = request.cookies.get(SESSION_COOKIE)
+        user = state.accounts.resolve_session(token) if token else None
+        if user is None:
+            raise HTTPException(401, "Not logged in, or your session expired — log in again.")
+        return user
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Starting connectors needs a running event loop — build_session()
-        # above is sync and does not do this itself (see session.py).
-        await start_connectors(state.session)
         poller = asyncio.create_task(_poll_tasks(state))
         try:
             yield
         finally:
             poller.cancel()
-            await stop_connectors(state.session)
-            state.session.tasks.close()
+            for chat_id in list(state.runtimes):
+                await _evict_runtime(state, chat_id)
+            state.accounts.close()
+            state.projects.close()
 
     app = FastAPI(title="grandice", lifespan=lifespan)
     app.state.grandice = state  # exposed for tests; routes below close over `state` directly
 
-    @app.get("/api/state")
-    async def get_state() -> dict[str, Any]:
-        return _snapshot(state)
+    # --- auth ---------------------------------------------------------
 
-    @app.get("/api/log")
-    async def get_log() -> list[dict[str, Any]]:
-        return state.broadcaster.history
+    @app.post("/api/auth/register", status_code=201)
+    async def register(body: RegisterIn, response: Response) -> dict[str, Any]:
+        try:
+            user = state.accounts.register(body.username, body.password)
+        except (ValueError, UsernameTaken) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        _set_session_cookie(response, state.accounts.create_session(user.id))
+        return {"id": user.id, "username": user.username}
 
-    @app.get("/api/files")
-    async def list_files(path: str = ".") -> dict[str, Any]:
-        return _list_dir(state.session, path)
+    @app.post("/api/auth/login")
+    async def login(body: LoginIn, response: Response) -> dict[str, Any]:
+        try:
+            user = state.accounts.authenticate(body.username, body.password)
+        except InvalidCredentials as exc:
+            raise HTTPException(401, str(exc)) from exc
+        _set_session_cookie(response, state.accounts.create_session(user.id))
+        return {"id": user.id, "username": user.username}
 
-    @app.get("/api/file_content")
-    async def file_content(path: str) -> dict[str, Any]:
-        return _read_file(state.session, path)
+    @app.post("/api/auth/logout")
+    async def logout(request: Request, response: Response) -> dict[str, Any]:
+        token = request.cookies.get(SESSION_COOKIE)
+        if token:
+            state.accounts.delete_session(token)
+        response.delete_cookie(SESSION_COOKIE)
+        return {"status": "ok"}
 
-    @app.post("/api/task", status_code=202)
-    async def start_task(body: TaskIn) -> dict[str, Any]:
+    @app.get("/api/auth/me")
+    async def me(user: User = Depends(current_user)) -> dict[str, Any]:
+        return {"id": user.id, "username": user.username}
+
+    # --- projects -------------------------------------------------------
+
+    @app.get("/api/projects")
+    async def list_projects(user: User = Depends(current_user)) -> list[dict[str, Any]]:
+        return [_project_dict(p) for p in state.projects.list_projects(user.id)]
+
+    @app.post("/api/projects", status_code=201)
+    async def create_project(body: ProjectIn, user: User = Depends(current_user)) -> dict[str, Any]:
+        return _project_dict(state.projects.create_project(user.id, body.name))
+
+    @app.delete("/api/projects/{project_id}")
+    async def delete_project(project_id: str, user: User = Depends(current_user)) -> dict[str, Any]:
+        try:
+            chats = state.projects.list_chats(project_id, user.id)
+            state.projects.delete_project(project_id, user.id)
+        except NotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        for chat in chats:
+            await _evict_runtime(state, chat.id)
+        return {"status": "deleted"}
+
+    # --- chats ------------------------------------------------------------
+
+    @app.get("/api/projects/{project_id}/chats")
+    async def list_chats(project_id: str, user: User = Depends(current_user)) -> list[dict[str, Any]]:
+        try:
+            return [_chat_dict(c) for c in state.projects.list_chats(project_id, user.id)]
+        except NotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/api/projects/{project_id}/chats", status_code=201)
+    async def create_chat(project_id: str, body: ChatIn, user: User = Depends(current_user)) -> dict[str, Any]:
+        try:
+            return _chat_dict(state.projects.create_chat(project_id, user.id, body.title))
+        except NotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.patch("/api/chats/{chat_id}")
+    async def rename_chat(chat_id: str, body: ChatIn, user: User = Depends(current_user)) -> dict[str, Any]:
+        try:
+            state.projects.rename_chat(chat_id, user.id, body.title)
+            return _chat_dict(state.projects.get_chat(chat_id, user.id))
+        except NotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.delete("/api/chats/{chat_id}")
+    async def delete_chat(chat_id: str, user: User = Depends(current_user)) -> dict[str, Any]:
+        try:
+            state.projects.delete_chat(chat_id, user.id)
+        except NotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        await _evict_runtime(state, chat_id)
+        return {"status": "deleted"}
+
+    # --- one chat's runtime: state, files, task, cancel, approve, events ---
+
+    @app.get("/api/chats/{chat_id}/state")
+    async def chat_state(chat_id: str, user: User = Depends(current_user)) -> dict[str, Any]:
+        _, runtime = await _resolve(state, chat_id, user)
+        return _snapshot(runtime)
+
+    @app.get("/api/chats/{chat_id}/log")
+    async def chat_log(chat_id: str, user: User = Depends(current_user)) -> list[dict[str, Any]]:
+        _, runtime = await _resolve(state, chat_id, user)
+        return runtime.broadcaster.history
+
+    @app.get("/api/chats/{chat_id}/files")
+    async def chat_files(chat_id: str, path: str = ".", user: User = Depends(current_user)) -> dict[str, Any]:
+        _, runtime = await _resolve(state, chat_id, user)
+        return _list_dir(runtime.session, path)
+
+    @app.get("/api/chats/{chat_id}/file_content")
+    async def chat_file_content(chat_id: str, path: str, user: User = Depends(current_user)) -> dict[str, Any]:
+        _, runtime = await _resolve(state, chat_id, user)
+        return _read_file(runtime.session, path)
+
+    @app.post("/api/chats/{chat_id}/task", status_code=202)
+    async def chat_task(chat_id: str, body: TaskIn, user: User = Depends(current_user)) -> dict[str, Any]:
         if not body.message.strip():
             raise HTTPException(400, "message must not be empty.")
-        if state.running:
-            raise HTTPException(409, "A task is already running — cancel it first, or wait.")
+        chat, runtime = await _resolve(state, chat_id, user)
+        if runtime.running:
+            raise HTTPException(409, "A task is already running in this chat — cancel it first, or wait.")
         # No `await` between the check above and this set, so two overlapping
         # requests on the same event loop cannot both pass the check.
-        state.running = True
-        state.session.cancelled = False
-        asyncio.create_task(_run(state, body.message))
+        runtime.running = True
+        runtime.session.cancelled = False
+        asyncio.create_task(_run(state, chat, runtime, body.message))
         return {"status": "started"}
 
-    @app.post("/api/cancel")
-    async def cancel_task() -> dict[str, Any]:
-        if not state.running:
+    @app.post("/api/chats/{chat_id}/cancel")
+    async def chat_cancel(chat_id: str, user: User = Depends(current_user)) -> dict[str, Any]:
+        _, runtime = await _resolve(state, chat_id, user)
+        if not runtime.running:
             raise HTTPException(409, "No task is running.")
-        state.session.cancelled = True
+        runtime.session.cancelled = True
         return {"status": "cancelling"}
 
-    @app.post("/api/approve")
-    async def approve(body: ApproveIn) -> dict[str, Any]:
-        future = state.pending_approvals.get(body.request_id)
+    @app.post("/api/chats/{chat_id}/approve")
+    async def chat_approve(chat_id: str, body: ApproveIn, user: User = Depends(current_user)) -> dict[str, Any]:
+        _, runtime = await _resolve(state, chat_id, user)
+        future = runtime.pending_approvals.get(body.request_id)
         if future is None or future.done():
-            raise HTTPException(
-                404, "No pending approval with that id — it may have already timed out or been answered."
-            )
+            raise HTTPException(404, "No pending approval with that id — it may have already timed out or been answered.")
         future.set_result(body.approved)
         return {"status": "ok"}
 
-    @app.get("/api/events")
-    async def events(request: Request) -> StreamingResponse:
-        return StreamingResponse(_stream(state, request), media_type="text/event-stream")
+    @app.get("/api/chats/{chat_id}/events")
+    async def chat_events(chat_id: str, request: Request, user: User = Depends(current_user)) -> StreamingResponse:
+        _, runtime = await _resolve(state, chat_id, user)
+        return StreamingResponse(_stream(runtime, request), media_type="text/event-stream")
 
     # Mounted last: StaticFiles(html=True) serves index.html at "/" and would
     # otherwise shadow any /api/* route registered after it.
@@ -153,41 +289,130 @@ def create_app(session: Session | None = None) -> FastAPI:
     return app
 
 
-async def _run(state: AppState, message: str) -> None:
+def _set_session_cookie(response: Response, token: str) -> None:
+    from .. import accounts as accounts_mod
+
+    response.set_cookie(
+        SESSION_COOKIE, token,
+        max_age=accounts_mod.SESSION_LIFETIME_SECONDS, httponly=True, samesite="lax",
+    )
+
+
+def _project_dict(p) -> dict[str, Any]:
+    return {"id": p.id, "name": p.name, "created_at": p.created_at}
+
+
+def _chat_dict(c: Chat) -> dict[str, Any]:
+    return {"id": c.id, "project_id": c.project_id, "title": c.title,
+            "created_at": c.created_at, "updated_at": c.updated_at}
+
+
+async def _resolve(state: AppState, chat_id: str, user: User) -> tuple[Chat, ChatRuntime]:
+    """Look up a chat (raising 404 if it doesn't exist or isn't this user's —
+    the same NotFound either way, so a request can't tell those apart) and
+    its runtime, building the runtime on first touch."""
     try:
-        async for event in agent_loop.run_turn(state.session, message):
-            state.broadcaster.publish(event_to_dict(event))
+        chat = state.projects.get_chat(chat_id, user.id)
+    except NotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if chat_id not in state.runtimes:
+        state.runtimes[chat_id] = await _build_runtime(state, chat)
+    return chat, state.runtimes[chat_id]
+
+
+async def _build_runtime(state: AppState, chat: Chat) -> ChatRuntime:
+    broadcaster = Broadcaster()
+    pending_approvals: dict[str, asyncio.Future] = {}
+
+    async def web_ask(payload: str) -> bool:
+        """This chat's Asker (§08/permissions.py): publish an approval_needed
+        event on *this chat's* broadcaster and await a Future that
+        /api/chats/{id}/approve resolves — the CLI's synchronous terminal
+        prompt, adapted to a per-chat event stream instead of one global one."""
+        request_id = uuid.uuid4().hex[:12]
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        pending_approvals[request_id] = future
+        broadcaster.publish({"type": "approval_needed", "request_id": request_id, "payload": payload})
+        try:
+            return await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            pending_approvals.pop(request_id, None)
+
+    project_config = replace(state.base_config, workspace=_project_workspace(state, chat.project_id))
+    session = build_session(project_config, Gate(web_ask))
+    session.messages = state.projects.load_messages(chat.id, chat.user_id)
+
+    runtime = ChatRuntime(session=session, broadcaster=broadcaster, pending_approvals=pending_approvals)
+    if session.connectors:
+        ready = asyncio.Event()
+        runtime._owner = asyncio.create_task(_own_connectors(runtime, ready))
+        await ready.wait()
+    return runtime
+
+
+async def _own_connectors(runtime: ChatRuntime, ready: asyncio.Event) -> None:
+    """Lives for exactly as long as this chat's connectors need to stay
+    open — started and stopped from this one task, never the request task
+    that triggered the build or the lifespan's own shutdown task. See
+    ChatRuntime's own comment for why that distinction matters here."""
+    await start_connectors(runtime.session)
+    ready.set()
+    await runtime._closing.wait()
+    await stop_connectors(runtime.session)
+
+
+async def _evict_runtime(state: AppState, chat_id: str) -> None:
+    runtime = state.runtimes.pop(chat_id, None)
+    if runtime is not None:
+        runtime._closing.set()
+        if runtime._owner is not None:
+            await runtime._owner
+        runtime.session.tasks.close()
+
+
+def _project_workspace(state: AppState, project_id: str) -> Path:
+    return state.projects_root / project_id / "workspace"
+
+
+async def _run(state: AppState, chat: Chat, runtime: ChatRuntime, message: str) -> None:
+    try:
+        async for event in agent_loop.run_turn(runtime.session, message):
+            runtime.broadcaster.publish(event_to_dict(event))
     finally:
-        state.running = False
+        runtime.running = False
+        # A chat's whole point is resuming exactly where it left off — save
+        # after every turn, not just on a clean shutdown.
+        state.projects.save_messages(chat.id, chat.user_id, runtime.session.messages)
         # Plan/cost/files may all have changed; tell the UI to refetch rather
         # than trying to diff every field into an event of its own.
-        state.broadcaster.publish({"type": "state_changed"})
+        runtime.broadcaster.publish({"type": "state_changed"})
 
 
 async def _poll_tasks(state: AppState) -> None:
     """Background tasks (spawn_background, §P4) run outside the SSE
-    broadcaster entirely — they're scheduled from inside a tool call, not
-    from _run above. Without this, a task's completion would only show up
-    in the dashboard on whatever unrelated state refresh happened to come
-    next. Polling is simpler than threading a callback through
-    tasks.py/subagents.py into a web-specific broadcaster, and 2 seconds is
-    frequent enough for a background task board, not a real-time feed."""
-    last: dict[str, str] = {}
+    broadcaster entirely — scheduled from inside a tool call, not from _run
+    above. Without this, a task's completion would only show up on
+    whatever unrelated state refresh happened to come next. One poller
+    covers every live chat's runtime, not just one global session."""
+    last: dict[str, dict[str, str]] = {}
     try:
         while True:
             await asyncio.sleep(TASK_POLL_SECONDS)
-            current = {t.id: t.status.value for t in state.session.tasks.list()}
-            if current != last:
-                state.broadcaster.publish({"type": "state_changed"})
-                last = current
+            for chat_id, runtime in list(state.runtimes.items()):
+                current = {t.id: t.status.value for t in runtime.session.tasks.list()}
+                if current != last.get(chat_id):
+                    runtime.broadcaster.publish({"type": "state_changed"})
+                    last[chat_id] = current
     except asyncio.CancelledError:
         pass
 
 
-async def _stream(state: AppState, request: Request):
-    queue = state.broadcaster.subscribe()
+async def _stream(runtime: ChatRuntime, request: Request):
+    queue = runtime.broadcaster.subscribe()
     try:
-        for event in state.broadcaster.history:
+        for event in runtime.broadcaster.history:
             yield f"data: {json.dumps(event)}\n\n"
         while True:
             if await request.is_disconnected():
@@ -198,11 +423,11 @@ async def _stream(state: AppState, request: Request):
             except asyncio.TimeoutError:
                 yield ": keep-alive\n\n"  # comment line — keeps proxies from closing the connection
     finally:
-        state.broadcaster.unsubscribe(queue)
+        runtime.broadcaster.unsubscribe(queue)
 
 
-def _snapshot(state: AppState) -> dict[str, Any]:
-    session = state.session
+def _snapshot(runtime: ChatRuntime) -> dict[str, Any]:
+    session = runtime.session
     ledger = session.router.ledger
     limiter = session.router.rate_limiter
     return {
@@ -214,7 +439,7 @@ def _snapshot(state: AppState) -> dict[str, Any]:
             "bulk": session.config.tiers.bulk,
         },
         "sandbox": session.sandbox.name,
-        "running": state.running,
+        "running": runtime.running,
         "plan": session.todos.items,
         "skills": [{"name": s.name, "description": s.description} for s in session.skills],
         "connectors": [c.spec.name for c in session.connectors],
@@ -298,8 +523,10 @@ def main() -> None:
     parser.add_argument(
         "--host", default="127.0.0.1",
         help="Bind address. Default is localhost-only — nothing is exposed even on an "
-             "EC2 instance unless you deliberately change this. Use an SSH tunnel "
-             "(`ssh -L 8000:localhost:8000 ...`) to view a remote instance instead.",
+             "EC2 instance unless you deliberately change this. Real accounts now guard "
+             "the data, but see accounts.py's own note: that's not the same as transport "
+             "security. Use HTTPS (a reverse proxy) or a VPN before binding this to "
+             "anything a shared network can reach.",
     )
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()

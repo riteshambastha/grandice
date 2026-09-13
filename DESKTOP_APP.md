@@ -14,8 +14,13 @@ native backend itself.
 .venv/bin/grandice-desktop
 ```
 
-Same session, same skills, same tools as `grandice-web` — just a real
-window instead of a browser tab. `--port 0` (the default) picks a free port
+Same login, same accounts/projects/chats, same skills and tools as
+`grandice-web` — just a real window instead of a browser tab. It shows the
+same login screen first (see the README's "Accounts, projects, chats") and
+reads/writes the same `~/.grandice/accounts.db` and `~/.grandice/
+projects.db`, so a project started in the browser dashboard is the same
+project you see if you open the desktop app next — same account, same
+data, different window. `--port 0` (the default) picks a free port
 automatically so it never collides with a `grandice-web` instance already
 running.
 

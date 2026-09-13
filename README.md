@@ -69,17 +69,39 @@ every file change, in-browser approval prompts for outward-facing tools, the
 current plan, a live-updating background-task list, cost and rate-limit
 meters, the skills catalog, and a workspace file browser with a preview pane.
 Send a task or cancel one from the page; any number of browser tabs can
-watch the same session at once.
+watch the same chat at once.
 
 ```bash
 .venv/bin/pip install -e ".[web]"
 .venv/bin/grandice-web            # http://127.0.0.1:8000
 ```
 
-It's a FastAPI app streaming Server-Sent Events to a single static page — no
-build step, no JS framework, nothing to compile. One process holds one
-`Session`; the dashboard observes and drives that same session the CLI would,
-just from a browser instead of a terminal.
+It's a FastAPI app streaming Server-Sent Events to a static page — no build
+step, no JS framework, nothing to compile.
+
+**Accounts, projects, chats.** The dashboard requires logging in (real
+bcrypt-hashed passwords, not a name picker — see `accounts.py`), and each
+account has its own **projects**, each project its own workspace/sandbox
+directory, each holding any number of **chats**. A chat is one persisted
+conversation: its message history is saved after every turn (`projects.py`),
+so closing the dashboard and coming back later — even after a server
+restart — resumes the real conversation, not just a blank session. Opening a
+chat builds it a `Session` on first touch (its own sandbox, its own event
+stream, its own running/approval state); two chats never share state, and
+one user's projects are invisible to another's — the whole reason this
+needed real authentication rather than a "pick a name" switcher was a small
+team using the same install, not just one person. There is deliberately no
+"create agents" UI yet — subagents remain something a running task spawns
+for itself (§P4), not something a person configures ahead of time from the
+dashboard.
+
+**A real limit worth stating plainly.** Login is real, but the network
+transport isn't secured by this alone — if the dashboard is reachable over
+plain HTTP by more than the one machine it runs on, credentials and every
+request are visible to anyone on that network path. Put it behind HTTPS (a
+reverse proxy) or a VPN before treating "small team, shared instance" as
+more than a local/trusted-network feature. See `accounts.py`'s own module
+docstring for the same point in more detail.
 
 **Diffs.** Every successful `write`/`edit` call produces a real unified diff
 (`difflib`, computed in `loop.py` around the tool call — before/after content,
@@ -336,16 +358,19 @@ the agent to ignore its instructions. It must summarise the file, not obey it.
 - `sandbox/Dockerfile` needs a manual rebuild after a skill gains a new
   dependency — there's no registry, so this only happens on whatever host
   actually runs the docker sandbox backend.
-- The dashboard has **no authentication** — its only protection is binding to
-  `127.0.0.1` by default. Do not point `--host` at a public interface without
-  adding auth in front of it first; use an SSH tunnel instead.
-- The dashboard holds one `Session` and runs one **top-level** task at a
-  time — multiple browser tabs can watch it, but not start independent
-  top-level tasks concurrently. `spawn_background` genuinely runs work
-  concurrently underneath that one task, which is real progress from before
-  P4, but the top-level constraint itself is still there; a queue of
-  independent top-level tasks would need multiple sessions, not addressed
-  here.
+- The dashboard requires login, but that secures *who's who*, not the wire —
+  binding to `127.0.0.1` by default is still the only transport protection.
+  Do not point `--host` at a public interface without HTTPS or a VPN in
+  front of it; a plain reachable HTTP dashboard leaks passwords and every
+  request to anyone on that network path. See "Accounts, projects, chats"
+  above.
+- Each **chat** runs one top-level task at a time — multiple browser tabs
+  can watch the same chat, but not start independent top-level tasks in it
+  concurrently. Different chats are fully independent, though, each with its
+  own `Session` and its own concurrency; `spawn_background` genuinely runs
+  work concurrently underneath a chat's one top-level task, which is real
+  progress from before P4, but the per-chat top-level constraint itself is
+  still there.
 - `mcp` is pinned to 1.x, not the newest release — see "Connectors" above.
   This ecosystem is moving fast enough that a routine `pip install --upgrade`
   could silently break both connectors; the pin is deliberate, not an

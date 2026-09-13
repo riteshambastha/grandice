@@ -18,6 +18,21 @@ import pytest
 from grandice.desktop import _free_port, _start_server
 
 
+@pytest.fixture(autouse=True)
+def _isolated_grandice_dirs(tmp_path, monkeypatch):
+    """_start_server calls create_app() with no path overrides, same as the
+    real desktop app — create_app() builds its AccountStore/ProjectStore
+    eagerly, before the server even starts, so *any* test in this file that
+    reaches _start_server (even one mocking uvicorn.Server itself) would
+    otherwise create a real account database in the user's actual
+    ~/.grandice/. Autouse so a new test can't reintroduce that by omission."""
+    import grandice.server.app as server_app_mod
+
+    monkeypatch.setattr(server_app_mod, "ACCOUNTS_DB_PATH", tmp_path / "accounts.db")
+    monkeypatch.setattr(server_app_mod, "PROJECTS_DB_PATH", tmp_path / "projects.db")
+    monkeypatch.setattr(server_app_mod, "PROJECTS_ROOT", tmp_path / "projects")
+
+
 def test_free_port_returns_a_bindable_port():
     port = _free_port()
     assert 0 < port < 65536
@@ -42,8 +57,17 @@ async def test_start_server_actually_serves_the_dashboard(tmp_path, monkeypatch)
     server = _start_server("127.0.0.1", port)
     try:
         assert server.started
-        async with httpx.AsyncClient() as client:
-            res = await client.get(f"http://127.0.0.1:{port}/api/state")
+        # The dashboard is auth-gated end to end now — proving it's actually
+        # serving grandice (not just some server) means logging in and
+        # reaching a real per-chat route, not just any 200.
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+            reg = await client.post(
+                "/api/auth/register", json={"username": "desktop-test", "password": "correct horse"}
+            )
+            assert reg.status_code == 201
+            project = (await client.post("/api/projects", json={"name": "demo"})).json()
+            chat = (await client.post(f"/api/projects/{project['id']}/chats", json={})).json()
+            res = await client.get(f"/api/chats/{chat['id']}/state")
         assert res.status_code == 200
         assert res.json()["live"] is False
     finally:

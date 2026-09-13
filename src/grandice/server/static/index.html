@@ -7,60 +7,101 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="brand-name">grandice</span>
-      <span id="badge-live" class="badge">…</span>
-    </div>
-    <div id="badge-row" class="badge-row"></div>
-  </header>
-
-  <main class="layout">
-    <section class="panel log-panel">
-      <h2>Session</h2>
-      <div id="log" class="log"></div>
-      <form id="task-form" class="task-form">
-        <textarea id="task-input" placeholder="Give it a task…" rows="2"></textarea>
-        <div class="task-buttons">
-          <button type="submit" id="send-btn">Send</button>
-          <button type="button" id="cancel-btn" disabled>Cancel</button>
-        </div>
+  <div id="auth-screen" class="auth-screen">
+    <div class="auth-box">
+      <div class="brand-name">grandice</div>
+      <div class="auth-tabs">
+        <button type="button" id="tab-login" class="auth-tab active">Log in</button>
+        <button type="button" id="tab-register" class="auth-tab">Register</button>
+      </div>
+      <form id="auth-form" class="auth-form">
+        <input id="auth-username" type="text" placeholder="Username" autocomplete="username" required />
+        <input id="auth-password" type="password" placeholder="Password" autocomplete="current-password" required />
+        <div id="auth-error" class="auth-error hidden"></div>
+        <button type="submit" id="auth-submit">Log in</button>
       </form>
-    </section>
+    </div>
+  </div>
 
-    <aside class="sidebar">
-      <section class="panel">
-        <h2>Plan</h2>
-        <ul id="plan-list" class="plan-list"><li class="muted">No plan yet.</li></ul>
+  <div id="app-screen" class="app-screen hidden">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-name">grandice</span>
+        <span id="badge-live" class="badge">…</span>
+      </div>
+      <div class="topbar-right">
+        <div id="badge-row" class="badge-row"></div>
+        <span id="whoami" class="whoami"></span>
+        <button id="logout-btn">Log out</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="nav-sidebar">
+        <section class="nav-section">
+          <div class="nav-header">
+            <h2>Projects</h2>
+            <button type="button" id="new-project-btn" class="icon-btn" title="New project">+</button>
+          </div>
+          <ul id="project-list" class="nav-list"><li class="muted">No projects yet.</li></ul>
+        </section>
+        <section class="nav-section">
+          <div class="nav-header">
+            <h2>Chats</h2>
+            <button type="button" id="new-chat-btn" class="icon-btn" title="New chat" disabled>+</button>
+          </div>
+          <ul id="chat-list" class="nav-list"><li class="muted">Select a project.</li></ul>
+        </section>
+      </aside>
+
+      <section class="panel log-panel">
+        <h2>Session</h2>
+        <div id="log" class="log"></div>
+        <div id="no-chat-notice" class="muted no-chat-notice hidden">Select or create a chat to get started.</div>
+        <div id="task-error" class="auth-error hidden"></div>
+        <form id="task-form" class="task-form">
+          <textarea id="task-input" placeholder="Give it a task…" rows="2" disabled></textarea>
+          <div class="task-buttons">
+            <button type="submit" id="send-btn" disabled>Send</button>
+            <button type="button" id="cancel-btn" disabled>Cancel</button>
+          </div>
+        </form>
       </section>
 
-      <section class="panel">
-        <h2>Cost &amp; rate limit</h2>
-        <div id="cost-panel"></div>
-      </section>
+      <aside class="sidebar">
+        <section class="panel">
+          <h2>Plan</h2>
+          <ul id="plan-list" class="plan-list"><li class="muted">No plan yet.</li></ul>
+        </section>
 
-      <section class="panel">
-        <h2>Skills</h2>
-        <ul id="skills-list" class="skills-list"></ul>
-      </section>
+        <section class="panel">
+          <h2>Cost &amp; rate limit</h2>
+          <div id="cost-panel"></div>
+        </section>
 
-      <section class="panel">
-        <h2>Tools &amp; connectors</h2>
-        <div id="tools-panel"></div>
-      </section>
+        <section class="panel">
+          <h2>Skills</h2>
+          <ul id="skills-list" class="skills-list"></ul>
+        </section>
 
-      <section class="panel">
-        <h2>Background tasks</h2>
-        <ul id="tasks-list" class="tasks-list"></ul>
-      </section>
+        <section class="panel">
+          <h2>Tools &amp; connectors</h2>
+          <div id="tools-panel"></div>
+        </section>
 
-      <section class="panel files-panel">
-        <h2>Workspace</h2>
-        <div id="file-breadcrumb" class="breadcrumb"></div>
-        <ul id="file-list" class="file-list"></ul>
-      </section>
-    </aside>
-  </main>
+        <section class="panel">
+          <h2>Background tasks</h2>
+          <ul id="tasks-list" class="tasks-list"></ul>
+        </section>
+
+        <section class="panel files-panel">
+          <h2>Workspace</h2>
+          <div id="file-breadcrumb" class="breadcrumb"></div>
+          <ul id="file-list" class="file-list"></ul>
+        </section>
+      </aside>
+    </main>
+  </div>
 
   <div id="file-modal" class="modal hidden">
     <div class="modal-inner">
@@ -81,6 +122,33 @@
       <div class="approval-buttons">
         <button id="approval-deny" class="deny">Deny</button>
         <button id="approval-approve" class="approve">Approve</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Generic text-input and confirm dialogs, replacing window.prompt/confirm
+       — not every embedding (this dashboard runs inside a plain browser tab,
+       but also inside a pywebview native window) reliably supports those
+       native dialogs. -->
+  <div id="prompt-modal" class="modal hidden">
+    <div class="modal-inner prompt-inner">
+      <div class="modal-header"><span id="prompt-title"></span></div>
+      <div class="prompt-body">
+        <input id="prompt-input" type="text" />
+      </div>
+      <div class="approval-buttons">
+        <button id="prompt-cancel">Cancel</button>
+        <button id="prompt-ok" class="approve">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="confirm-modal" class="modal hidden">
+    <div class="modal-inner prompt-inner">
+      <div class="modal-header"><span id="confirm-message"></span></div>
+      <div class="approval-buttons">
+        <button id="confirm-cancel">Cancel</button>
+        <button id="confirm-ok" class="deny">Delete</button>
       </div>
     </div>
   </div>

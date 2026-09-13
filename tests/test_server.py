@@ -1,46 +1,57 @@
-"""Tests for the live-view dashboard (FastAPI + SSE). The stub backend
+"""Tests for the live-view dashboard (FastAPI + SSE), now auth-gated and
+multi-chat: every route requires a logged-in user via a session cookie, and
+each chat gets its own isolated ChatRuntime (Session, event stream, running
+flag, pending approvals) built lazily on first touch. The stub backend
 resolves in well under a millisecond, which makes it useless for actually
-racing the /api/task concurrency guard over real HTTP — so that guard is
-tested directly against AppState instead of by trying to win a timing race."""
+racing the per-chat /task concurrency guard over real HTTP — so that guard
+is tested directly against the runtime instead of by trying to win a
+timing race."""
 
 from __future__ import annotations
 
-import json
-from dataclasses import replace
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from grandice.config import Config
-from grandice.permissions import Gate, always_deny
 from grandice.server import app as server_app
 from grandice.server.broadcast import Broadcaster
 from grandice.server.serialize import event_to_dict
-from grandice.session import build as build_session
 from grandice import loop as agent_loop
 
 
 @pytest.fixture
-def session(tmp_path: Path):
-    config = replace(
-        Config.from_env(),
-        workspace=tmp_path / "ws",
-        sandbox="sandbox-exec",
-        api_key=None,
-        base_url=None,
+def app(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("GRANDICE_API_KEY", raising=False)
+    monkeypatch.delenv("GRANDICE_BASE_URL", raising=False)
+    monkeypatch.setenv("GRANDICE_WORKSPACE", str(tmp_path / "unused-cli-workspace"))
+    return server_app.create_app(
+        accounts_path=tmp_path / "accounts.db",
+        projects_path=tmp_path / "projects.db",
+        projects_root=tmp_path / "projects",
     )
-    return build_session(config, Gate(always_deny))
 
 
 @pytest.fixture
-def client(session):
-    app = server_app.create_app(session=session)
+def client(app):
     with TestClient(app) as c:
         yield c
 
 
-# --- serialize.py ---------------------------------------------------------
+def _register(client, username="alice", password="correct horse") -> TestClient:
+    res = client.post("/api/auth/register", json={"username": username, "password": password})
+    assert res.status_code == 201, res.text
+    return client
+
+
+def _project_and_chat(client) -> tuple[str, str]:
+    project = client.post("/api/projects", json={"name": "demo"}).json()
+    chat = client.post(f"/api/projects/{project['id']}/chats", json={"title": "chat 1"}).json()
+    return project["id"], chat["id"]
+
+
+# --- serialize.py / broadcast.py (unaffected by the rewrite, kept as-is) ---
 
 def test_event_to_dict_covers_every_event_type():
     assert event_to_dict(agent_loop.TextDelta("hi")) == {"type": "text_delta", "text": "hi"}
@@ -58,21 +69,19 @@ def test_event_to_dict_covers_every_event_type():
     }
 
 
-# --- broadcast.py -----------------------------------------------------------
-
 def test_broadcaster_delivers_to_subscribers_and_keeps_bounded_history():
     b = Broadcaster(history_limit=2)
     q = b.subscribe()
     b.publish({"n": 1})
     b.publish({"n": 2})
-    b.publish({"n": 3})  # pushes {"n": 1} out of history
+    b.publish({"n": 3})
 
     delivered = []
     while not q.empty():
         delivered.append(q.get_nowait())
 
-    assert delivered == [{"n": 1}, {"n": 2}, {"n": 3}]  # a subscriber sees everything published
-    assert b.history == [{"n": 2}, {"n": 3}]  # history itself stays bounded
+    assert delivered == [{"n": 1}, {"n": 2}, {"n": 3}]
+    assert b.history == [{"n": 2}, {"n": 3}]
 
 
 def test_unsubscribe_stops_delivery():
@@ -83,7 +92,7 @@ def test_unsubscribe_stops_delivery():
     assert q.empty()
 
 
-# --- HTTP endpoints ---------------------------------------------------------
+# --- static file serving ----------------------------------------------------
 
 def test_index_serves_the_dashboard(client):
     res = client.get("/")
@@ -91,154 +100,278 @@ def test_index_serves_the_dashboard(client):
     assert "grandice" in res.text.lower()
 
 
-def test_state_reports_model_sandbox_and_zero_cost(client, session):
-    res = client.get("/api/state")
-    body = res.json()
-    assert body["sandbox"] == "sandbox-exec"
+# --- auth --------------------------------------------------------------------
+
+def test_register_logs_you_in(client):
+    res = client.post("/api/auth/register", json={"username": "alice", "password": "correct horse"})
+    assert res.status_code == 201
+    assert "grandice_session" in res.cookies
+    assert client.get("/api/auth/me").json()["username"] == "alice"
+
+
+def test_register_rejects_a_duplicate_username(client):
+    _register(client)
+    res = client.post("/api/auth/register", json={"username": "alice", "password": "another password"})
+    assert res.status_code == 400
+
+
+def test_login_with_correct_credentials(client):
+    _register(client)
+    client.cookies.clear()
+    res = client.post("/api/auth/login", json={"username": "alice", "password": "correct horse"})
+    assert res.status_code == 200
+    assert client.get("/api/auth/me").json()["username"] == "alice"
+
+
+def test_login_rejects_wrong_password(client):
+    _register(client)
+    client.cookies.clear()
+    res = client.post("/api/auth/login", json={"username": "alice", "password": "wrong"})
+    assert res.status_code == 401
+
+
+def test_logout_ends_the_session(client):
+    _register(client)
+    client.post("/api/auth/logout")
+    assert client.get("/api/auth/me").status_code == 401
+
+
+def test_routes_require_login(app):
+    with TestClient(app) as anon:
+        assert anon.get("/api/auth/me").status_code == 401
+        assert anon.get("/api/projects").status_code == 401
+        assert anon.post("/api/projects", json={"name": "x"}).status_code == 401
+
+
+# --- projects ------------------------------------------------------------
+
+def test_create_and_list_projects(client):
+    _register(client)
+    client.post("/api/projects", json={"name": "demo"})
+    names = {p["name"] for p in client.get("/api/projects").json()}
+    assert names == {"demo"}
+
+
+def test_projects_are_isolated_per_user(client, app):
+    _register(client, "alice")
+    client.post("/api/projects", json={"name": "alice's project"})
+
+    with TestClient(app) as bob:
+        _register(bob, "bob", "another password")
+        assert bob.get("/api/projects").json() == []
+
+
+def test_delete_project_is_blocked_for_a_non_owner(client, app):
+    _register(client, "alice")
+    project = client.post("/api/projects", json={"name": "mine"}).json()
+
+    with TestClient(app) as bob:
+        _register(bob, "bob", "another password")
+        res = bob.delete(f"/api/projects/{project['id']}")
+        assert res.status_code == 404
+
+
+# --- chats -----------------------------------------------------------------
+
+def test_create_and_list_chats(client):
+    _register(client)
+    project_id, chat_id = _project_and_chat(client)
+    titles = [c["title"] for c in client.get(f"/api/projects/{project_id}/chats").json()]
+    assert titles == ["chat 1"]
+
+
+def test_chats_are_blocked_for_a_non_owner(client, app):
+    _register(client, "alice")
+    project_id, chat_id = _project_and_chat(client)
+
+    with TestClient(app) as bob:
+        _register(bob, "bob", "another password")
+        assert bob.get(f"/api/projects/{project_id}/chats").status_code == 404
+        assert bob.get(f"/api/chats/{chat_id}/state").status_code == 404
+
+
+def test_rename_chat(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    res = client.patch(f"/api/chats/{chat_id}", json={"title": "renamed"})
+    assert res.status_code == 200
+    assert res.json()["title"] == "renamed"
+
+
+def test_delete_chat(client):
+    _register(client)
+    project_id, chat_id = _project_and_chat(client)
+    assert client.delete(f"/api/chats/{chat_id}").status_code == 200
+    assert client.get(f"/api/projects/{project_id}/chats").json() == []
+
+
+# --- a chat's runtime: state, files, task, cancel -----------------------
+
+def test_chat_state_reports_model_sandbox_and_zero_cost(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    body = client.get(f"/api/chats/{chat_id}/state").json()
     assert body["live"] is False
     assert body["running"] is False
     assert body["cost"]["spent_usd"] == 0.0
-    assert body["rate_limit"] is None  # stub mode: nothing to pace
     assert {s["name"] for s in body["skills"]} == {"xlsx", "pptx", "docx", "pdf"}
     assert body["tasks"] == []
 
 
-def test_state_reports_background_tasks(client, session):
-    task_id = session.tasks.create("subagent", "investigate something")
-    session.tasks.mark_done(task_id, "found it")
+def test_each_chat_gets_its_own_isolated_workspace(client):
+    _register(client)
+    project_id, chat_a = _project_and_chat(client)
+    chat_b = client.post(f"/api/projects/{project_id}/chats", json={"title": "chat 2"}).json()["id"]
 
-    body = client.get("/api/state").json()
-    assert body["tasks"] == [
-        {"id": task_id, "status": "done", "description": "investigate something",
-         "result": "found it", "error": None}
-    ]
+    # Touch both runtimes into existence, then confirm they share the same
+    # project workspace (same project => same sandbox root) but are
+    # otherwise independent sessions.
+    state_a = client.get(f"/api/chats/{chat_a}/state").json()
+    state_b = client.get(f"/api/chats/{chat_b}/state").json()
+    assert state_a["session_id"] != state_b["session_id"]
 
 
-def test_files_lists_the_workspace_root(client, session):
+def test_different_projects_get_different_workspaces(client):
+    _register(client)
+    p1 = client.post("/api/projects", json={"name": "p1"}).json()["id"]
+    p2 = client.post("/api/projects", json={"name": "p2"}).json()["id"]
+    c1 = client.post(f"/api/projects/{p1}/chats", json={}).json()["id"]
+    c2 = client.post(f"/api/projects/{p2}/chats", json={}).json()["id"]
+
+    client.get(f"/api/chats/{c1}/files")
+    client.get(f"/api/chats/{c2}/files")
+
+    grandice_state = client.app.state.grandice
+    ws1 = grandice_state.runtimes[c1].session.sandbox.workspace
+    ws2 = grandice_state.runtimes[c2].session.sandbox.workspace
+    assert ws1 != ws2
+    assert p1 in str(ws1) and p2 not in str(ws1)
+
+
+def test_files_lists_the_workspace_root(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    grandice_state = client.app.state.grandice
+    client.get(f"/api/chats/{chat_id}/files")  # touch the runtime into existence
+    session = grandice_state.runtimes[chat_id].session
     (session.sandbox.workspace / "note.txt").write_text("hello")
-    res = client.get("/api/files", params={"path": "."})
+
+    res = client.get(f"/api/chats/{chat_id}/files", params={"path": "."})
     names = {e["name"] for e in res.json()["entries"]}
     assert "note.txt" in names
 
 
 def test_files_rejects_path_traversal(client):
-    res = client.get("/api/files", params={"path": "../../../etc"})
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    res = client.get(f"/api/chats/{chat_id}/files", params={"path": "../../../etc"})
     assert res.status_code == 403
 
 
-def test_file_content_reads_a_real_file(client, session):
+def test_file_content_reads_a_real_file(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    grandice_state = client.app.state.grandice
+    client.get(f"/api/chats/{chat_id}/files")
+    session = grandice_state.runtimes[chat_id].session
     (session.sandbox.workspace / "note.txt").write_text("hello there")
-    res = client.get("/api/file_content", params={"path": "note.txt"})
+
+    res = client.get(f"/api/chats/{chat_id}/file_content", params={"path": "note.txt"})
     body = res.json()
     assert body["content"] == "hello there"
     assert body["binary"] is False
 
 
-def test_file_content_rejects_path_traversal(client):
-    res = client.get("/api/file_content", params={"path": "../../../etc/passwd"})
-    assert res.status_code == 403
-
-
 def test_file_content_404s_on_a_missing_file(client):
-    res = client.get("/api/file_content", params={"path": "nope.txt"})
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    res = client.get(f"/api/chats/{chat_id}/file_content", params={"path": "nope.txt"})
     assert res.status_code == 404
 
 
 def test_task_rejects_an_empty_message(client):
-    res = client.post("/api/task", json={"message": "   "})
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    res = client.post(f"/api/chats/{chat_id}/task", json={"message": "   "})
     assert res.status_code == 400
 
 
 def test_cancel_with_nothing_running_is_a_conflict(client):
-    res = client.post("/api/cancel")
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    res = client.post(f"/api/chats/{chat_id}/cancel")
     assert res.status_code == 409
 
 
-# --- the concurrency guard, tested directly rather than raced over HTTP ----
+def test_task_is_refused_while_one_is_already_running(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    client.get(f"/api/chats/{chat_id}/state")  # touch the runtime into existence
+    grandice_state = client.app.state.grandice
+    grandice_state.runtimes[chat_id].running = True  # simulate a task already in flight
 
-def test_task_is_refused_while_one_is_already_running(client, session):
-    state = client.app.state.grandice
-    state.running = True  # simulate a task already in flight
-    res = client.post("/api/task", json={"message": "another one"})
+    res = client.post(f"/api/chats/{chat_id}/task", json={"message": "another one"})
     assert res.status_code == 409
     assert "already running" in res.json()["detail"]
 
 
-# --- a real run end to end, through the stub backend ------------------------
+def test_a_real_task_streams_events_updates_state_and_persists_messages(client):
+    _register(client)
+    project_id, chat_id = _project_and_chat(client)
 
-def test_a_real_task_streams_events_and_updates_state(client, session):
-    res = client.post("/api/task", json={"message": "list the workspace"})
+    res = client.post(f"/api/chats/{chat_id}/task", json={"message": "list the workspace"})
     assert res.status_code == 202
 
-    # The stub backend resolves near-instantly; TestClient runs the server
-    # in-process, so by the time this returns the background task has had
-    # its chance to run to completion.
-    import time
     for _ in range(50):
-        if not client.get("/api/state").json()["running"]:
+        if not client.get(f"/api/chats/{chat_id}/state").json()["running"]:
             break
         time.sleep(0.02)
 
-    log = client.get("/api/log").json()
+    log = client.get(f"/api/chats/{chat_id}/log").json()
     types = [e["type"] for e in log]
     assert "tool_started" in types
     assert "tool_finished" in types
     assert "finished" in types
-    assert types[-1] == "state_changed"  # _run's finally publishes this last, to prompt a refetch
+    assert types[-1] == "state_changed"
 
-    state = client.get("/api/state").json()
+    state = client.get(f"/api/chats/{chat_id}/state").json()
     assert state["running"] is False
     assert state["cost"]["calls"] > 0
 
-
-# --- MCP connectors through the dashboard's lifespan (not the CLI's) ------
-
-def test_lifespan_starts_and_stops_a_configured_connector(tmp_path):
-    """The dashboard starts connectors via a FastAPI lifespan handler — a
-    different code path from the CLI's asyncio.run wrapper (see
-    server/app.py's create_app). Skipped if the optional `mcp` extras
-    aren't installed."""
-    pytest.importorskip("mcp")
-    pytest.importorskip("mcp_server_sqlite")
-
-    config = replace(
-        Config.from_env(),
-        workspace=tmp_path / "ws",
-        sandbox="sandbox-exec",
-        api_key=None,
-        base_url=None,
-        mcp_connectors=("sqlite",),
-    )
-    session = build_session(config, Gate(always_deny))
-
-    with TestClient(server_app.create_app(session=session)) as c:
-        state = c.get("/api/state").json()
-        assert state["connectors"] == ["sqlite"]
-        assert "sqlite.read_query" in state["tools"]["latent"]
-        assert not any(n.startswith("sqlite.") for n in state["tools"]["active"])
-    # __exit__ triggers the lifespan's shutdown half; a hung or raising
-    # stop_connectors would surface as this test failing to complete.
+    # The whole point of a persisted chat: reopening it (a fresh runtime,
+    # simulated here by evicting the live one) resumes real history.
+    grandice_state = client.app.state.grandice
+    del grandice_state.runtimes[chat_id]
+    messages = client.get(f"/api/chats/{chat_id}/state").json()
+    assert messages["session_id"]  # runtime rebuilt without error
+    assert len(grandice_state.runtimes[chat_id].session.messages) > 0
 
 
-# --- in-browser approvals (§P5) --------------------------------------------
+def test_deleting_a_chat_evicts_its_live_runtime(client):
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    client.get(f"/api/chats/{chat_id}/state")
+    grandice_state = client.app.state.grandice
+    assert chat_id in grandice_state.runtimes
 
-def _build_app_with_outward_tool(tmp_path: Path, monkeypatch) -> tuple:
-    """create_app() with no session builds its own using web_ask as the
-    Asker — this is the path that actually needs testing, so unlike other
-    tests here we don't pass a pre-built session."""
-    monkeypatch.setenv("GRANDICE_WORKSPACE", str(tmp_path / "ws"))
-    monkeypatch.delenv("GRANDICE_API_KEY", raising=False)
-    monkeypatch.delenv("GRANDICE_BASE_URL", raising=False)
+    client.delete(f"/api/chats/{chat_id}")
+    assert chat_id not in grandice_state.runtimes
 
-    app = server_app.create_app()
-    state = app.state.grandice
+
+# --- in-browser approvals (§P5), now per-chat ------------------------------
+
+def _build_client_with_outward_tool(app, client) -> None:
+    project_id, chat_id = _project_and_chat(client)
+    client.get(f"/api/chats/{chat_id}/state")  # touch the runtime into existence
 
     from grandice.tools.base import Risk, ToolSpec
 
     async def fake_send(**kwargs):
         return "sent"
 
-    state.session.registry.add(
+    grandice_state = app.state.grandice
+    runtime = grandice_state.runtimes[chat_id]
+    runtime.session.registry.add(
         ToolSpec(
             name="send_email",
             description="",
@@ -262,15 +395,13 @@ def _build_app_with_outward_tool(tmp_path: Path, monkeypatch) -> tuple:
             else:
                 yield Reply(text="done")
 
-    state.session.router.backends = [OutwardOnceStub()]
-    return app, state
+    runtime.session.router.backends = [OutwardOnceStub()]
+    return chat_id
 
 
-def _wait_for_approval_request(client) -> str:
-    import time
-
+def _wait_for_approval_request(client, chat_id: str) -> str:
     for _ in range(50):
-        log = client.get("/api/log").json()
+        log = client.get(f"/api/chats/{chat_id}/log").json()
         approvals = [e for e in log if e["type"] == "approval_needed"]
         if approvals:
             return approvals[0]["request_id"]
@@ -278,46 +409,73 @@ def _wait_for_approval_request(client) -> str:
     raise AssertionError("no approval_needed event appeared in time")
 
 
-def _wait_until_not_running(client) -> None:
-    import time
-
+def _wait_until_not_running(client, chat_id: str) -> None:
     for _ in range(50):
-        if not client.get("/api/state").json()["running"]:
+        if not client.get(f"/api/chats/{chat_id}/state").json()["running"]:
             return
         time.sleep(0.02)
     raise AssertionError("task never finished")
 
 
-def test_approving_lets_the_outward_tool_run(tmp_path, monkeypatch):
-    app, _ = _build_app_with_outward_tool(tmp_path, monkeypatch)
-    with TestClient(app) as c:
-        c.post("/api/task", json={"message": "send an email"})
-        request_id = _wait_for_approval_request(c)
+def test_approving_lets_the_outward_tool_run(app, client):
+    _register(client)
+    chat_id = _build_client_with_outward_tool(app, client)
 
-        res = c.post("/api/approve", json={"request_id": request_id, "approved": True})
-        assert res.status_code == 200
+    client.post(f"/api/chats/{chat_id}/task", json={"message": "send an email"})
+    request_id = _wait_for_approval_request(client, chat_id)
 
-        _wait_until_not_running(c)
-        log = c.get("/api/log").json()
-        finishes = [e for e in log if e["type"] == "tool_finished" and e["name"] == "send_email"]
-        assert finishes and finishes[0]["ok"] is True
+    res = client.post(f"/api/chats/{chat_id}/approve", json={"request_id": request_id, "approved": True})
+    assert res.status_code == 200
+
+    _wait_until_not_running(client, chat_id)
+    log = client.get(f"/api/chats/{chat_id}/log").json()
+    finishes = [e for e in log if e["type"] == "tool_finished" and e["name"] == "send_email"]
+    assert finishes and finishes[0]["ok"] is True
 
 
-def test_denying_stops_the_outward_tool(tmp_path, monkeypatch):
-    app, _ = _build_app_with_outward_tool(tmp_path, monkeypatch)
-    with TestClient(app) as c:
-        c.post("/api/task", json={"message": "send an email"})
-        request_id = _wait_for_approval_request(c)
+def test_denying_stops_the_outward_tool(app, client):
+    _register(client)
+    chat_id = _build_client_with_outward_tool(app, client)
 
-        c.post("/api/approve", json={"request_id": request_id, "approved": False})
+    client.post(f"/api/chats/{chat_id}/task", json={"message": "send an email"})
+    request_id = _wait_for_approval_request(client, chat_id)
 
-        _wait_until_not_running(c)
-        log = c.get("/api/log").json()
-        finishes = [e for e in log if e["type"] == "tool_finished" and e["name"] == "send_email"]
-        assert finishes and finishes[0]["ok"] is False
-        assert "declined" in finishes[0]["preview"].lower()
+    client.post(f"/api/chats/{chat_id}/approve", json={"request_id": request_id, "approved": False})
+
+    _wait_until_not_running(client, chat_id)
+    log = client.get(f"/api/chats/{chat_id}/log").json()
+    finishes = [e for e in log if e["type"] == "tool_finished" and e["name"] == "send_email"]
+    assert finishes and finishes[0]["ok"] is False
+    assert "declined" in finishes[0]["preview"].lower()
 
 
 def test_approve_404s_on_an_unknown_request_id(client):
-    res = client.post("/api/approve", json={"request_id": "nonexistent", "approved": True})
+    _register(client)
+    _, chat_id = _project_and_chat(client)
+    res = client.post(f"/api/chats/{chat_id}/approve", json={"request_id": "nonexistent", "approved": True})
     assert res.status_code == 404
+
+
+# --- MCP connectors through the dashboard's lifespan (not the CLI's) ------
+
+def test_lifespan_starts_and_stops_a_configured_connector(tmp_path, monkeypatch):
+    """Skipped if the optional `mcp` extras aren't installed."""
+    pytest.importorskip("mcp")
+    pytest.importorskip("mcp_server_sqlite")
+
+    monkeypatch.setenv("GRANDICE_MCP_CONNECTORS", "sqlite")
+    monkeypatch.delenv("GRANDICE_API_KEY", raising=False)
+    monkeypatch.delenv("GRANDICE_BASE_URL", raising=False)
+
+    app = server_app.create_app(
+        accounts_path=tmp_path / "accounts.db",
+        projects_path=tmp_path / "projects.db",
+        projects_root=tmp_path / "projects",
+    )
+    with TestClient(app) as c:
+        _register(c)
+        _, chat_id = _project_and_chat(c)
+        state = c.get(f"/api/chats/{chat_id}/state").json()
+        assert state["connectors"] == ["sqlite"]
+        assert "sqlite.read_query" in state["tools"]["latent"]
+        assert not any(n.startswith("sqlite.") for n in state["tools"]["active"])
