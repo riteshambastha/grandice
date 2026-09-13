@@ -24,7 +24,8 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
 
 def assemble(session: Session) -> list[dict[str, Any]]:
     """System prompt, transcript, and a constraint reminder near the end."""
-    system = prompts.SYSTEM
+    connector_names = [c.spec.name for c in session.connectors]
+    system = prompts.system_prompt(connector_names)
     catalog = skills_mod.catalog(session.skills)  # Tier 1 (§07) — name + description only
     if catalog:
         system = f"{system}\n\n{catalog}"
@@ -36,7 +37,7 @@ def assemble(session: Session) -> list[dict[str, Any]]:
         out.append(
             {
                 "role": "user",
-                "content": prompts.REMINDER.format(plan=session.todos.render()),
+                "content": prompts.reminder(session.todos.render(), connector_names),
             }
         )
     return out

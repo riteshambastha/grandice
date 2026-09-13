@@ -11,7 +11,7 @@ import pytest
 from grandice import loop as agent_loop
 from grandice.config import Config
 from grandice.permissions import Gate, always_deny
-from grandice.router import Ledger, CostCapExceeded, Reply, Router, ToolCall, _parse_call
+from grandice.router import Backend, Ledger, CostCapExceeded, Reply, Router, ToolCall, _parse_call
 from grandice.session import build as build_session
 from grandice.tools.base import Risk, ToolSpec, truncate, validate
 
@@ -186,3 +186,49 @@ async def test_every_tool_call_is_logged_with_its_arguments(session):
     records = [json.loads(l) for l in session.log_path.read_text().splitlines()]
     calls = [r for r in records if r["kind"] == "tool_call"]
     assert calls and calls[0]["arguments"] == {"pattern": "**/*"}
+
+
+# §05 — a genuinely empty reply from the model (no text, no tool calls)
+#
+# Real, observed failure mode on a self-hosted model (confirmed live against
+# an Ollama-hosted qwen3:8b through the actual dashboard): a turn would end
+# with no text and no tool call at all, and the loop treated that exactly
+# like "done talking" with nothing to distinguish it — the dashboard/CLI
+# showed a bare "done" line with zero visible content for that entire turn,
+# indistinguishable from the model choosing to say nothing on purpose.
+
+class _StubReplyBackend(Backend):
+    """A backend that always yields one fixed Reply, for exercising
+    run_turn's handling of that reply's shape."""
+
+    name = "stub-reply"
+
+    def __init__(self, reply: Reply) -> None:
+        self._reply = reply
+
+    async def complete(self, model, messages, tools, temperature):
+        yield self._reply
+
+
+async def test_empty_reply_gets_a_distinct_reason_not_a_silent_done(session):
+    session.router.backends = [_StubReplyBackend(Reply(text="", tool_calls=[]))]
+
+    events = [e async for e in agent_loop.run_turn(session, "hello")]
+
+    text_deltas = [e for e in events if isinstance(e, agent_loop.TextDelta)]
+    assert text_deltas == []  # nothing to stream — the reply was genuinely empty
+
+    finished = [e for e in events if isinstance(e, agent_loop.Finished)][0]
+    assert finished.reason != "done"
+    assert "empty reply" in finished.reason
+
+
+async def test_a_normal_text_only_reply_still_says_done(session):
+    """The fix must not misfire on the ordinary "model is done talking"
+    case — only a reply with *neither* text nor tool calls gets the new
+    reason; ordinary final text still just says "done"."""
+    session.router.backends = [_StubReplyBackend(Reply(text="All done.", tool_calls=[]))]
+
+    events = [e async for e in agent_loop.run_turn(session, "hello")]
+    finished = [e for e in events if isinstance(e, agent_loop.Finished)][0]
+    assert finished.reason == "done"

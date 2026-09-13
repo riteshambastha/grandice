@@ -112,6 +112,18 @@ async def run_turn(
         session.log("assistant", text=reply.text, tool_calls=[tc.name for tc in reply.tool_calls])
 
         if not reply.tool_calls:
+            # A genuinely empty reply (no text, no tool call) is a real,
+            # observed failure mode on self-hosted models — confirmed live
+            # against an Ollama-hosted model, which occasionally ends a turn
+            # this way with no visible cause. Left as plain "done", this was
+            # indistinguishable from the model legitimately having nothing
+            # more to say: the dashboard/CLI showed nothing at all for that
+            # turn beyond a blank "done" line. A distinct reason here still
+            # ends the turn the same way, but renders differently (the
+            # dashboard styles any reason other than "done" as a warning),
+            # so an empty reply is now visibly flagged rather than silent.
+            if not reply.text:
+                reason = "model returned an empty reply — try rephrasing, or send another message to continue"
             break  # the model is done talking
 
         for call in reply.tool_calls:

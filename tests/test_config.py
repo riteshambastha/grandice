@@ -4,36 +4,15 @@ fail-loud-not-silent-stub behaviour when only one of the paired vars is set.
 
 These monkeypatch os.environ directly and call Config.from_env() (rather
 than going through .env/.env.local) so the test doesn't depend on this
-machine's actual dotenv files."""
+machine's actual dotenv files — conftest.py's autouse fixture already
+clears every GRANDICE_* var before each test, so this file only needs to
+set the specific ones each test cares about."""
 
 from __future__ import annotations
 
 import pytest
 
 from grandice.config import PLACEHOLDER_API_KEY, Config, ConfigError
-
-_ALL_RELEVANT_VARS = [
-    "GRANDICE_LLM_BASE_URL",
-    "GRANDICE_LLM_API_KEY",
-    "GRANDICE_LLM_CHAT_MODEL",
-    "GRANDICE_LLM_EMBEDDING_MODEL",
-    "GRANDICE_LLM_TIMEOUT_SECONDS",
-    "GRANDICE_BASE_URL",
-    "GRANDICE_API_KEY",
-    "GRANDICE_ORCHESTRATOR",
-    "GRANDICE_WORKER",
-    "GRANDICE_BULK",
-    "GRANDICE_REQUESTS_PER_MINUTE",
-    "GRANDICE_DAILY_REQUEST_CAP",
-]
-
-
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    """Every test starts from a blank slate for these vars, regardless of
-    what this machine's own .env happens to set."""
-    for var in _ALL_RELEVANT_VARS:
-        monkeypatch.delenv(var, raising=False)
 
 
 def test_neither_pair_set_stays_in_stub_mode():
