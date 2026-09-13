@@ -53,7 +53,7 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 118 tests
+.venv/bin/pytest -q                        # 122 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
@@ -122,16 +122,22 @@ pywebview picks WKWebView, WebView2 or GTK WebKit itself.
 .venv/bin/grandice-desktop
 ```
 
-A standalone packaged app (`.app` on macOS, `.exe` on Windows) builds from
-one PyInstaller spec for both: `./desktop/build_mac.sh` or `.\desktop\
-build_windows.ps1`. The macOS build is verified — built, launched as the
-actual frozen binary (not run from source), and checked over real HTTP that
-it found all four skills and every tool from inside the bundle alone. The
-Windows path is written to be correct but **not verified the same way** —
-this dev environment is macOS-only. See [DESKTOP_APP.md](DESKTOP_APP.md)
-for exactly what that distinction means, the two frozen-app path-resolution
-fixes packaging required, and a real, pre-existing gap worth knowing before
-relying on a Windows build: there's no lightweight sandbox for Windows yet,
+A standalone packaged app (`.app` on macOS, `.exe` on Windows), with a real
+icon, builds from one PyInstaller spec for both: `./desktop/build_mac.sh`
+or `.\desktop\build_windows.ps1`. `cp -R dist/grandice.app /Applications/`
+afterward makes it a real double-clickable icon in Applications, Launchpad
+and Spotlight. The macOS build is verified — built, launched via `open` (the
+actual double-click path, not just running the binary from a terminal —
+that distinction is what caught a real bug: Finder launches a GUI app with
+cwd `/`, and the workspace default used to be a relative path that resolved
+to an unwritable `/workspace` there, failing silently with no terminal to
+show it), and checked over real HTTP that it found all four skills and
+every tool from inside the bundle alone. The Windows path is written to be
+correct but **not verified the same way** — this dev environment is
+macOS-only. See [DESKTOP_APP.md](DESKTOP_APP.md) for exactly what that
+distinction means, the frozen-app fixes packaging required, and a real,
+pre-existing gap worth knowing before relying on a Windows build: there's
+no lightweight sandbox for Windows yet,
 so it either needs Docker Desktop (the existing default) or runs
 unsandboxed.
 

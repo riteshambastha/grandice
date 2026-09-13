@@ -7,7 +7,10 @@ automatable."""
 
 from __future__ import annotations
 
+import os
 import socket
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -63,3 +66,67 @@ async def test_start_server_raises_if_never_ready(monkeypatch):
 
     with pytest.raises(RuntimeError, match="did not start"):
         desktop_mod._start_server("127.0.0.1", _free_port())
+
+
+# --- the workspace-default fix -------------------------------------------
+#
+# Real bug, found by actually launching the packaged app via `open` (not
+# just running it from a terminal): Finder/LaunchServices launches a GUI
+# app with cwd "/" (confirmed directly with a throwaway probe .app that
+# wrote its own `pwd` to a file). Config.from_env()'s workspace default is
+# the *relative* string "workspace", which resolves to "/workspace" against
+# that cwd — unwritable by a normal account, so session.build() raised
+# inside the server's background thread with nowhere to show the error
+# (console=False). Running the same binary directly from a terminal masked
+# this entirely, since the shell's cwd happened to already contain a
+# writable workspace/ directory.
+
+def test_apply_default_workspace_sets_an_absolute_path(monkeypatch):
+    from grandice.desktop import DEFAULT_WORKSPACE, _apply_default_workspace
+
+    monkeypatch.delenv("GRANDICE_WORKSPACE", raising=False)
+    _apply_default_workspace()
+    assert os.environ["GRANDICE_WORKSPACE"] == str(DEFAULT_WORKSPACE)
+    assert Path(os.environ["GRANDICE_WORKSPACE"]).is_absolute()
+
+
+def test_apply_default_workspace_never_overrides_a_users_own_setting(monkeypatch):
+    from grandice.desktop import _apply_default_workspace
+
+    monkeypatch.setenv("GRANDICE_WORKSPACE", "/somewhere/the/user/chose")
+    _apply_default_workspace()
+    assert os.environ["GRANDICE_WORKSPACE"] == "/somewhere/the/user/chose"
+
+
+def test_default_workspace_is_not_the_relative_path_that_caused_the_bug():
+    """Config.from_env()'s own bare default ("workspace") is exactly what
+    resolved to the unwritable "/workspace" under a GUI launch — this pins
+    down that desktop.py's default can never regress back to it."""
+    from grandice.desktop import DEFAULT_WORKSPACE
+
+    assert DEFAULT_WORKSPACE.is_absolute()
+    assert DEFAULT_WORKSPACE != Path("workspace").resolve()
+
+
+# --- the error-visibility fallback ----------------------------------------
+
+def test_main_writes_the_error_log_and_shows_a_window_on_startup_failure(monkeypatch, tmp_path):
+    """A failure that reaches this far away from a terminal must never just
+    vanish — checked by forcing _start_server to raise and confirming both
+    halves of the fallback actually ran, not just that main() didn't crash
+    the test process."""
+    import grandice.desktop as desktop_mod
+
+    log_path = tmp_path / "desktop-error.log"
+    monkeypatch.setattr(desktop_mod, "ERROR_LOG_PATH", log_path)
+    monkeypatch.setattr(desktop_mod, "_start_server", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    shown = {}
+    monkeypatch.setattr(desktop_mod, "_show_error_window", lambda message: shown.setdefault("message", message))
+    monkeypatch.setattr(sys, "argv", ["grandice-desktop"])
+
+    desktop_mod.main()
+
+    assert log_path.exists()
+    assert "boom" in log_path.read_text()
+    assert "boom" in shown.get("message", "")

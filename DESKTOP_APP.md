@@ -28,27 +28,42 @@ bundle on macOS, a folder with a `.exe` on Windows.
 ```bash
 # macOS
 ./desktop/build_mac.sh
-open dist/grandice.app
+open dist/grandice.app                              # try it in place, or:
+cp -R dist/grandice.app /Applications/               # install it — a real,
+                                                      # double-clickable icon
+                                                      # in Applications/Launchpad/
+                                                      # Spotlight from then on
 
 # Windows (run from Windows, in PowerShell)
 .\desktop\build_windows.ps1
 dist\grandice\grandice.exe
 ```
 
-**What "verified" means here, precisely.** The macOS build was actually run
-end to end in this repo's own development: built with `build_mac.sh`,
-launched as the packaged `.app` (not `python -m grandice.desktop` — the real
-frozen binary), and checked over real HTTP that it discovered all four
-skills, all twelve tools, and the correct sandbox backend from inside the
-bundle with no source checkout or venv present at runtime. The Windows
-build is **not** verified the same way — this development environment is
-macOS-only, so `build_windows.ps1` and the spec's Windows path have not run
-against a real Windows machine. The spec is written to be correct there (see
-the two frozen-app fixes below), but "written to be correct" and "verified"
-are different claims, and only the macOS one has been checked.
+The app has a real icon (`desktop/icon/grandice.icns`, built once and
+committed — regenerating it isn't part of the normal build) — a dark
+rounded square with the dashboard's own accent-blue "g", matching the
+web dashboard's own visual identity rather than a placeholder.
 
-If you build on Windows and something breaks, the first two places to look
-are exactly the two things packaging changed:
+**What "verified" means here, precisely.** The macOS build was actually run
+end to end in this repo's own development — twice, because the first pass
+caught a real bug the second pass then confirmed fixed. Built with
+`build_mac.sh`, launched as the packaged `.app` (not `python -m
+grandice.desktop` — the real frozen binary), and checked over real HTTP that
+it discovered all four skills, all twelve tools, and the correct sandbox
+backend from inside the bundle with no source checkout or venv present at
+runtime. Critically, this was checked through **`open` (the actual
+double-click path)**, not just by running the binary directly from a
+terminal — that distinction is what caught the bug below in the first
+place. The Windows build is **not** verified the same way — this
+development environment is macOS-only, so `build_windows.ps1` and the
+spec's Windows path have not run against a real Windows machine. The spec
+is written to be correct there (see the frozen-app fixes below), but
+"written to be correct" and "verified" are different claims, and only the
+macOS one has been checked.
+
+If you build on Windows and something breaks, the first three places to
+look are exactly the three things packaging (and the desktop shell itself)
+changed:
 
 - **`skills.py`'s path resolution.** In a normal checkout, `skills.py` finds
   the canonical `skills/` directory by climbing up from its own file path —
@@ -62,6 +77,23 @@ are exactly the two things packaging changed:
   relative to the module, not climbing to a repo root) — but only because
   the spec's `datas` list explicitly bundles `server/static/`, since
   PyInstaller does not walk into a package's non-`.py` files unless told to.
+- **A real bug, caught only by testing the actual double-click path:**
+  Finder/LaunchServices launches a GUI app with cwd `/` — confirmed
+  directly, with a throwaway probe `.app` that wrote its own `pwd` to a
+  file. `Config.from_env()`'s workspace default is the *relative* string
+  `"workspace"`, which resolves against that cwd to `/workspace` —
+  unwritable by a normal account, so `session.build()` raised inside the
+  server's background thread with no terminal to print to
+  (`console=False`) and no window ever opened. Running the same binary
+  directly from a terminal masked this completely, since the shell's cwd
+  happened to already contain a writable `workspace/` — which is exactly
+  why this was checked via `open`, not just direct execution.
+  `desktop.main()` now sets `GRANDICE_WORKSPACE` to an absolute
+  `~/Documents/grandice/workspace` before touching anything, if the user
+  hasn't set one themselves. Any *other* startup failure that reaches this
+  far now has a net rather than vanishing the same way: it's logged to
+  `~/.grandice/desktop-error.log` and shown in a plain error window instead
+  of silently failing to appear.
 
 ## Known limits
 
@@ -71,8 +103,6 @@ are exactly the two things packaging changed:
   SmartScreen warning. Normal for early-stage software, not something this
   build fixes — real signing needs a paid Apple Developer certificate and a
   Windows code-signing certificate, neither set up here.
-- **No app icon.** `BUNDLE(..., icon=None, ...)` in the spec — a generic
-  icon today, not a missing feature so much as a not-yet-designed one.
 - **The Windows sandbox story is genuinely incomplete**, and this predates
   the desktop app — it's a real gap worth knowing before treating a Windows
   build as more than a first try. `Config.from_env()` defaults to the

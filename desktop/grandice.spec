@@ -72,6 +72,6 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name="grandice.app",
-        icon=None,  # no icon designed yet — a bare app bundle is fine for a first build
+        icon=str(REPO_ROOT / "desktop" / "icon" / "grandice.icns"),
         bundle_identifier="com.grandice.desktop",
     )
