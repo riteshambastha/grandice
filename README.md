@@ -53,13 +53,64 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 122 tests
+.venv/bin/pytest -q                        # 188 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
 **Deploying to AWS?** See [DEPLOY_AWS.md](DEPLOY_AWS.md) — EC2 sizing, Docker
 setup, and why the harness runs directly on the host rather than in its own
 container.
+
+### A private, self-hosted gateway (e.g. Ollama over Tailscale)
+
+The router is provider-agnostic — anything OpenAI-compatible works, including
+a model you run yourself. `GRANDICE_LLM_BASE_URL`/`GRANDICE_LLM_API_KEY`/
+`GRANDICE_LLM_CHAT_MODEL`/`GRANDICE_LLM_EMBEDDING_MODEL` are the recognized
+vars for this (they take priority over `GRANDICE_BASE_URL`/`GRANDICE_API_KEY`
+when both are set — see `config.py`'s `Config.from_env()`), and they go in
+**`.env.local`**, not `.env` — a separate file specifically so a private
+gateway key never has to sit alongside everything else, gitignored the same
+way. Edit `.env.local` directly (it ships with a placeholder key) and never
+paste a real key into chat, a commit, or anywhere else that leaves the
+machine.
+
+```bash
+# .env.local
+GRANDICE_LLM_BASE_URL=https://your-tailscale-host.ts.net/v1
+GRANDICE_LLM_API_KEY=...                 # your real gateway key, edited in directly
+GRANDICE_LLM_CHAT_MODEL=chat
+GRANDICE_LLM_EMBEDDING_MODEL=embed       # optional — see Router.embed() in router.py
+
+.venv/bin/python scripts/smoke_test_llm.py   # one real call through Router/Config, proves the wiring
+```
+
+Setting only one of `GRANDICE_LLM_BASE_URL`/`GRANDICE_LLM_API_KEY` raises a
+clear `ConfigError` at startup rather than silently falling back to
+something else — a half-set private-gateway config is almost always a
+mistake, not an intentional choice. An **unedited placeholder key is treated
+as the whole pair being unset** (not an error, not "live"), so simply
+creating `.env.local` from the template never flips a normal run into
+hitting a network endpoint on its own.
+
+If the gateway is only reachable via Tailscale (MagicDNS hostnames like
+`*.ts.net`), install and connect Tailscale on this machine first — `brew
+install tailscale`, then `sudo tailscale up` and sign in with the **same
+Tailscale account** the gateway host is on. Verify with `tailscale status`
+and by curling the gateway's own health endpoint before pointing grandice at
+it. grandice itself never installs or configures Tailscale — that's a
+system-level networking change outside what this project touches.
+
+Connection failures, an invalid/revoked key (401), a model the key isn't
+permitted to use (403), and a timeout are each reported as a distinct, clear
+error rather than one generic failure — see `router.py`'s
+`OpenAICompatBackend.complete()`. A self-hosted model can be slow on a cold
+start; raise `GRANDICE_LLM_TIMEOUT_SECONDS` (default 60s) if that's a
+recurring problem rather than a one-off.
+
+A private box has no external rate limit the way OpenRouter's free tier
+does, so `GRANDICE_REQUESTS_PER_MINUTE`/`GRANDICE_DAILY_REQUEST_CAP` default
+much higher automatically once a private gateway is what's live — set them
+explicitly only if you actually want a cap.
 
 ## Live view
 

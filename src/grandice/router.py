@@ -107,11 +107,14 @@ class OpenAICompatBackend(Backend):
 
     MAX_RATE_LIMIT_RETRIES = 3
 
-    def __init__(self, base_url: str, api_key: str, name: str = "openai-compat") -> None:
+    def __init__(
+        self, base_url: str, api_key: str, name: str = "openai-compat", timeout: float = 60.0
+    ) -> None:
         from openai import AsyncOpenAI
 
         self.name = name
-        self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self._timeout = timeout
+        self._client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
 
     async def complete(
         self,
@@ -120,7 +123,13 @@ class OpenAICompatBackend(Backend):
         tools: list[dict[str, Any]],
         temperature: float,
     ) -> AsyncIterator[str | Reply]:
-        from openai import RateLimitError
+        from openai import (
+            APIConnectionError,
+            APITimeoutError,
+            AuthenticationError,
+            PermissionDeniedError,
+            RateLimitError,
+        )
 
         attempt = 0
         while True:
@@ -128,6 +137,37 @@ class OpenAICompatBackend(Backend):
                 async for item in self._stream_once(model, messages, tools, temperature):
                     yield item
                 return
+            except AuthenticationError as exc:
+                # HTTP 401 — the key itself, not the request, is the problem.
+                raise RuntimeError(
+                    f"{self.name} rejected the API key as invalid or revoked (401). "
+                    f"Check GRANDICE_LLM_API_KEY / GRANDICE_API_KEY. Provider said: "
+                    f"{_error_message(exc)}"
+                ) from exc
+            except PermissionDeniedError as exc:
+                # HTTP 403 — a valid key, but not for this model.
+                raise RuntimeError(
+                    f"{self.name} refused to run {model!r} with this key (403 — model not "
+                    f"permitted). Provider said: {_error_message(exc)}"
+                ) from exc
+            except APITimeoutError as exc:
+                # Must be caught before APIConnectionError: it's a subclass.
+                raise RuntimeError(
+                    f"{self.name} timed out waiting for {model!r} after {self._timeout}s. "
+                    f"A self-hosted model can be slow on first load (cold start) or under load — "
+                    f"raise GRANDICE_LLM_TIMEOUT_SECONDS if this happens consistently, otherwise "
+                    f"retry."
+                ) from exc
+            except APIConnectionError as exc:
+                # No response at all — the gateway's box, its Tailscale
+                # tunnel, or the network between here and it is down, not
+                # something the model/request caused.
+                raise RuntimeError(
+                    f"Could not reach {self.name} at all ({exc}). If this is a private "
+                    f"gateway, check that the host machine is on and Tailscale is connected "
+                    f"on both ends (`tailscale status`), and that the health endpoint "
+                    f"responds."
+                ) from exc
             except RateLimitError as exc:
                 # A 429 is not always an actual rate limit — some providers
                 # (confirmed on Z.ai) reuse the status code for "no balance
@@ -319,7 +359,11 @@ class Router:
         if backends is not None:
             self.backends = backends
         elif config.live:
-            self.backends = [OpenAICompatBackend(config.base_url, config.api_key, name="primary")]
+            self.backends = [
+                OpenAICompatBackend(
+                    config.base_url, config.api_key, name="primary", timeout=config.llm_timeout_seconds
+                )
+            ]
         else:
             self.backends = [StubBackend()]
 
@@ -363,3 +407,32 @@ class Router:
                 last_error = exc
                 continue
         raise RuntimeError(f"All backends failed. Last error: {last_error}")
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embeddings via the same OpenAI-compatible base_url/api_key as chat
+        completions, against `config.embedding_model` — no tool or feature in
+        grandice consumes this yet (there's no RAG/retrieval tool), but it's
+        real, callable config for a gateway that offers one, not a dead
+        setting. Not routed through `self.backends`/the stub: embeddings
+        don't make sense to script, so this requires live config and an
+        embedding_model, rather than silently no-op'ing."""
+        if not self.config.live:
+            raise RuntimeError(
+                "embed() needs a live model config (GRANDICE_LLM_BASE_URL/API_KEY or "
+                "GRANDICE_BASE_URL/API_KEY) — none is set."
+            )
+        if not self.config.embedding_model:
+            raise RuntimeError(
+                "embed() needs GRANDICE_LLM_EMBEDDING_MODEL set to the gateway's embedding "
+                "model id."
+            )
+
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
+            timeout=self.config.llm_timeout_seconds,
+        )
+        response = await client.embeddings.create(model=self.config.embedding_model, input=texts)
+        return [item.embedding for item in response.data]

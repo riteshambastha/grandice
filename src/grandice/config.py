@@ -7,9 +7,33 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 load_dotenv()
+# A second, more-specific env file for a private/self-hosted model gateway
+# (e.g. a Tailscale-tunneled Ollama box) — kept separate from `.env` so a
+# real gateway key never has to sit in the same file as everything else,
+# and separately gitignored for the same reason. Loaded with override=True:
+# when both files set the same var, the private-gateway file wins, since a
+# deliberately-created `.env.local` signals a specific intent to point at
+# that gateway. Both files start out gitignored; see `.gitignore`.
+_env_local = find_dotenv(".env.local", usecwd=True)
+if _env_local:
+    load_dotenv(_env_local, override=True)
+
+# The exact placeholder .env.local ships with for GRANDICE_LLM_API_KEY —
+# recognized here (not just by scripts/smoke_test_llm.py) so an unedited
+# .env.local never accidentally looks "live". Keep this in sync with the
+# literal value in .env.local's own template.
+PLACEHOLDER_API_KEY = "REPLACE_WITH_YOUR_GLL_KEY"
+
+
+class ConfigError(RuntimeError):
+    """Raised when environment configuration is present but contradictory —
+    e.g. a base URL with no key, or vice versa. Deliberately louder than
+    silently falling back to the stub router: a half-set private-gateway
+    config almost always means the person configuring it made a mistake,
+    not that they meant to run without a real model."""
 
 # Free-tier OpenRouter picks, chosen from a live catalog fetch (2026-09-12) by
 # provider-stated fit, not from training-data memory — this roster "shifts
@@ -71,6 +95,16 @@ class Config:
     # the orchestrator's own job instead.
     subagent_max_steps: int = 40
 
+    # A private/self-hosted gateway's embedding model, if it has one — no
+    # feature in grandice consumes this yet (there's no RAG/retrieval tool),
+    # but it's real, callable config: see `router.embed()`.
+    embedding_model: str | None = None
+
+    # Reasonable default for a self-hosted model that may run on CPU and be
+    # much slower than a hosted API — the OpenAI SDK's own default (10
+    # minutes) is too patient to double as "the gateway is unreachable."
+    llm_timeout_seconds: float = 60.0
+
     @property
     def live(self) -> bool:
         """False means the stub router — the loop still runs, nothing is billed."""
@@ -79,23 +113,83 @@ class Config:
     @classmethod
     def from_env(cls) -> Config:
         default_sandbox = "sandbox-exec" if sys.platform == "darwin" else "docker"
-        return cls(
-            base_url=os.getenv("GRANDICE_BASE_URL") or None,
-            api_key=os.getenv("GRANDICE_API_KEY") or None,
-            tiers=Tiers(
+
+        # GRANDICE_LLM_BASE_URL/API_KEY (a private/self-hosted gateway, e.g. a
+        # Tailscale-tunneled Ollama box) take priority over the older
+        # GRANDICE_BASE_URL/API_KEY (OpenRouter or a first-party vendor) when
+        # both are set — either scheme points at the same Config fields,
+        # since the router only ever needs one base_url/api_key pair.
+        llm_base_url = os.getenv("GRANDICE_LLM_BASE_URL")
+        llm_api_key = os.getenv("GRANDICE_LLM_API_KEY")
+        if llm_api_key == PLACEHOLDER_API_KEY:
+            # .env.local ships with this placeholder so the file (and a
+            # working, error-free stub-mode app) exists before anyone edits
+            # it — treat an unedited placeholder as the whole pair being
+            # unset, not as "half configured." Real bug this guards against:
+            # without it, merely creating .env.local from the template
+            # flipped every grandice run (including the test suite) into
+            # "live" mode against an unreachable host, since a non-empty
+            # placeholder string is still truthy.
+            llm_base_url = None
+            llm_api_key = None
+        if bool(llm_base_url) != bool(llm_api_key):
+            raise ConfigError(
+                "GRANDICE_LLM_BASE_URL and GRANDICE_LLM_API_KEY must both be set together "
+                f"to use a private model gateway — only {'GRANDICE_LLM_BASE_URL' if llm_base_url else 'GRANDICE_LLM_API_KEY'} "
+                "is set. Set both in .env.local, or unset both to fall back to "
+                "GRANDICE_BASE_URL/GRANDICE_API_KEY (or the stub router if those are unset too)."
+            )
+        base_url = llm_base_url or os.getenv("GRANDICE_BASE_URL") or None
+        api_key = llm_api_key or os.getenv("GRANDICE_API_KEY") or None
+
+        # A gateway that only exposes one chat model (the common case for a
+        # self-hosted box) sets all three tiers to it. Deliberately NOT
+        # falling through to GRANDICE_ORCHESTRATOR/WORKER/BULK here: those
+        # vars belong to the legacy GRANDICE_BASE_URL/API_KEY path, and this
+        # repo's own .env already ships them pre-filled with OpenRouter model
+        # ids from an earlier setup — letting those leak through would send
+        # a real OpenRouter model name to a gateway that has never heard of
+        # it (caught by actually running this against the real gateway: the
+        # tier silently stayed "nvidia/nemotron-3-..." instead of "chat").
+        # Per-tier control on your own gateway is still possible — just don't
+        # set GRANDICE_LLM_CHAT_MODEL and set GRANDICE_ORCHESTRATOR/WORKER/
+        # BULK directly to your own model ids instead.
+        using_private_gateway = bool(llm_base_url and llm_api_key)
+        chat_model = os.getenv("GRANDICE_LLM_CHAT_MODEL")
+
+        if using_private_gateway and chat_model:
+            tiers = Tiers(orchestrator=chat_model, worker=chat_model, bulk=chat_model)
+        else:
+            tiers = Tiers(
                 orchestrator=os.getenv("GRANDICE_ORCHESTRATOR", Tiers.orchestrator),
                 worker=os.getenv("GRANDICE_WORKER", Tiers.worker),
                 bulk=os.getenv("GRANDICE_BULK", Tiers.bulk),
-            ),
+            )
+
+        # The 18/min-50/day defaults below are OpenRouter-free-tier-specific
+        # (see .env.example) — a private, self-hosted gateway has no such
+        # limit, so defaulting to it would silently throttle a local box
+        # after 50 calls a day for no reason. Only applies when neither
+        # GRANDICE_REQUESTS_PER_MINUTE nor GRANDICE_DAILY_REQUEST_CAP is set
+        # explicitly; either can still override it either way.
+        default_rpm = "100000" if using_private_gateway else "18"
+        default_daily = "100000" if using_private_gateway else "50"
+
+        return cls(
+            base_url=base_url,
+            api_key=api_key,
+            tiers=tiers,
             workspace=Path(os.getenv("GRANDICE_WORKSPACE", "workspace")).resolve(),
             sandbox=os.getenv("GRANDICE_SANDBOX", default_sandbox),
             sandbox_image=os.getenv("GRANDICE_SANDBOX_IMAGE", "grandice-sandbox:py3.12"),
             cost_cap_usd=float(os.getenv("GRANDICE_COST_CAP_USD", "2.00")),
-            requests_per_minute=int(os.getenv("GRANDICE_REQUESTS_PER_MINUTE", "18")),
-            daily_request_cap=int(os.getenv("GRANDICE_DAILY_REQUEST_CAP", "50")),
+            requests_per_minute=int(os.getenv("GRANDICE_REQUESTS_PER_MINUTE", default_rpm)),
+            daily_request_cap=int(os.getenv("GRANDICE_DAILY_REQUEST_CAP", default_daily)),
             mcp_connectors=tuple(
                 c.strip() for c in os.getenv("GRANDICE_MCP_CONNECTORS", "").split(",") if c.strip()
             ),
             mcp_sqlite_path=os.getenv("GRANDICE_MCP_SQLITE_PATH", "workspace.db"),
             subagent_max_steps=int(os.getenv("GRANDICE_SUBAGENT_MAX_STEPS", "40")),
+            embedding_model=os.getenv("GRANDICE_LLM_EMBEDDING_MODEL") or None,
+            llm_timeout_seconds=float(os.getenv("GRANDICE_LLM_TIMEOUT_SECONDS", "60")),
         )

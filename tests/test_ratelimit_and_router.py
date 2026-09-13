@@ -151,3 +151,152 @@ async def test_a_genuine_rate_limit_still_retries_with_backoff(monkeypatch):
 
     assert len(calls) == OpenAICompatBackend.MAX_RATE_LIMIT_RETRIES + 1
     assert len(slept) == OpenAICompatBackend.MAX_RATE_LIMIT_RETRIES  # it did back off, unlike the billing case
+
+
+# --- OpenAICompatBackend: 401/403/timeout/connection-failure, each a clear,
+# distinct error rather than one generic "backend failed" message -----------
+#
+# Written for the private-gateway integration (a Tailscale-tunneled
+# self-hosted box): a revoked key, an unpermitted model, a slow cold-started
+# local model, and the desktop/tunnel being offline are all real, distinct
+# failure modes a user needs to tell apart at a glance.
+
+def _make_backend(name: str = "test", timeout: float = 60.0):
+    from grandice.router import OpenAICompatBackend
+
+    backend = OpenAICompatBackend.__new__(OpenAICompatBackend)  # skip __init__, no real client needed
+    backend.name = name
+    backend._timeout = timeout
+    return backend
+
+
+def _http_error(cls, status: int, message: str):
+    import httpx
+
+    request = httpx.Request("POST", "https://example.invalid/chat/completions")
+    response = httpx.Response(status, request=request, json={"error": {"message": message}})
+    return cls(message, response=response, body={"message": message})
+
+
+async def test_401_reports_an_invalid_or_revoked_key(monkeypatch):
+    from openai import AuthenticationError
+
+    backend = _make_backend()
+    error = _http_error(AuthenticationError, 401, "Invalid API key")
+
+    async def fake_stream_once(self, *a, **kw):
+        raise error
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(type(backend), "_stream_once", fake_stream_once)
+
+    with pytest.raises(RuntimeError, match="invalid or revoked"):
+        async for _ in backend.complete("chat", [], [], 0.2):
+            pass
+
+
+async def test_403_reports_model_not_permitted(monkeypatch):
+    from openai import PermissionDeniedError
+
+    backend = _make_backend()
+    error = _http_error(PermissionDeniedError, 403, "You do not have access to this model")
+
+    async def fake_stream_once(self, *a, **kw):
+        raise error
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(type(backend), "_stream_once", fake_stream_once)
+
+    with pytest.raises(RuntimeError, match="not permitted"):
+        async for _ in backend.complete("chat", [], [], 0.2):
+            pass
+
+
+async def test_timeout_reports_a_clear_timeout_message_with_the_configured_seconds(monkeypatch):
+    from openai import APITimeoutError
+
+    backend = _make_backend(timeout=42.0)
+
+    async def fake_stream_once(self, *a, **kw):
+        raise APITimeoutError(request=None)
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(type(backend), "_stream_once", fake_stream_once)
+
+    with pytest.raises(RuntimeError, match="timed out.*42"):
+        async for _ in backend.complete("chat", [], [], 0.2):
+            pass
+
+
+async def test_connection_failure_mentions_tailscale(monkeypatch):
+    from openai import APIConnectionError
+
+    backend = _make_backend()
+
+    async def fake_stream_once(self, *a, **kw):
+        raise APIConnectionError(message="Connection refused", request=None)
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(type(backend), "_stream_once", fake_stream_once)
+
+    with pytest.raises(RuntimeError, match="Tailscale"):
+        async for _ in backend.complete("chat", [], [], 0.2):
+            pass
+
+
+# --- Router.embed() ---------------------------------------------------------
+
+async def test_embed_requires_live_config():
+    config = replace(Config.from_env(), api_key=None, base_url=None)
+    router = Router(config)
+    with pytest.raises(RuntimeError, match="live model config"):
+        await router.embed(["hello"])
+
+
+async def test_embed_requires_an_embedding_model_configured():
+    config = replace(
+        Config.from_env(), api_key="gll-x", base_url="https://example.invalid/v1", embedding_model=None
+    )
+    router = Router(config, backends=[StubBackend()], rate_limiter=None)
+    with pytest.raises(RuntimeError, match="GRANDICE_LLM_EMBEDDING_MODEL"):
+        await router.embed(["hello"])
+
+
+async def test_embed_calls_the_configured_base_url_and_model(monkeypatch):
+    config = replace(
+        Config.from_env(),
+        api_key="gll-x",
+        base_url="https://example.invalid/v1",
+        embedding_model="embed",
+    )
+    router = Router(config, backends=[StubBackend()], rate_limiter=None)
+
+    captured = {}
+
+    class FakeEmbeddings:
+        async def create(self, model, input):
+            captured["model"] = model
+            captured["input"] = input
+
+            class Item:
+                embedding = [0.1, 0.2]
+
+            class Result:
+                data = [Item(), Item()]
+
+            return Result()
+
+    class FakeClient:
+        def __init__(self, base_url, api_key, timeout):
+            captured["base_url"] = base_url
+            captured["api_key"] = api_key
+            self.embeddings = FakeEmbeddings()
+
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeClient)
+
+    vectors = await router.embed(["a", "b"])
+
+    assert captured["base_url"] == "https://example.invalid/v1"
+    assert captured["model"] == "embed"
+    assert captured["input"] == ["a", "b"]
+    assert vectors == [[0.1, 0.2], [0.1, 0.2]]
