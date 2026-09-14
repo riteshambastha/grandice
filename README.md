@@ -53,7 +53,7 @@ wall of 429s, once the day's budget is spent.
 ```bash
 .venv/bin/grandice --model <id> "..."      # swap orchestrator, any OpenAI-compatible id
 .venv/bin/grandice --sandbox docker "..."  # force the container backend on macOS too
-.venv/bin/pytest -q                        # 233 tests
+.venv/bin/pytest -q                        # 242 tests
 .venv/bin/python evals/run.py              # score a model, pass/fail + cost + wall-clock
 ```
 
@@ -101,11 +101,33 @@ it. grandice itself never installs or configures Tailscale — that's a
 system-level networking change outside what this project touches.
 
 Connection failures, an invalid/revoked key (401), a model the key isn't
-permitted to use (403), and a timeout are each reported as a distinct, clear
-error rather than one generic failure — see `router.py`'s
-`OpenAICompatBackend.complete()`. A self-hosted model can be slow on a cold
-start; raise `GRANDICE_LLM_TIMEOUT_SECONDS` (default 60s) if that's a
-recurring problem rather than a one-off.
+permitted to use (403), a timeout, and a connection dropped mid-response are
+each reported as a distinct, clear error rather than one generic failure —
+see `router.py`'s `OpenAICompatBackend.complete()`. A self-hosted model can
+be slow on a cold start; raise `GRANDICE_LLM_TIMEOUT_SECONDS` (default 60s)
+if that's a recurring problem rather than a one-off.
+
+**Response length.** Three real limits, each found by actually running a
+long request (summarizing an uploaded CSV) rather than just reading the
+code: no `max_tokens` was ever sent on a completion request at all, so the
+provider's own default silently capped every response — fixed with a
+generous, configurable default (`GRANDICE_MAX_OUTPUT_TOKENS`, 16,000
+tokens). A tool result (e.g. reading a large uploaded file) was capped at
+2,000 tokens (~8,000 characters) before this — raised and made
+configurable (`GRANDICE_TOOL_RESULT_BUDGET`, 16,000 tokens). And the
+dashboard's own per-chat event history — which a chat replays from when
+reopened — was capped at 500 events, easily exceeded by one verbose
+streamed reply; raised to 20,000. None of these three were hard architectural
+limits — all three were just numbers picked before anyone had actually
+tried a long response through them, and rebalancing was more accurate to
+call "removing an accidental cap" than "raising a deliberate one." A
+connection genuinely dropped mid-stream by the gateway itself (confirmed
+live: `httpx.RemoteProtocolError`, "peer closed connection without sending
+complete message body") is a different, real limit this doesn't remove —
+that's the gateway or the network path to it giving up on a very long
+generation, surfaced as a clear error rather than retried silently, since a
+retry can't cleanly un-show the partial response already streamed to the
+page.
 
 A private box has no external rate limit the way OpenRouter's free tier
 does, so `GRANDICE_REQUESTS_PER_MINUTE`/`GRANDICE_DAILY_REQUEST_CAP` are

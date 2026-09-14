@@ -206,7 +206,7 @@ class _StubReplyBackend(Backend):
     def __init__(self, reply: Reply) -> None:
         self._reply = reply
 
-    async def complete(self, model, messages, tools, temperature):
+    async def complete(self, model, messages, tools, temperature, max_tokens=None):
         yield self._reply
 
 

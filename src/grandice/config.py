@@ -72,8 +72,21 @@ class Config:
     # Context limits (§05.3, §05.4).
     context_window: int = 128_000
     compact_at: float = 0.70
-    tool_result_budget: int = 2_000
+    # Real bug, found live: a tool result (e.g. `read` on an uploaded CSV)
+    # over this was silently cut to ~8,000 characters — fine as a safety
+    # net against one huge result blowing the whole context window (the
+    # rest still lands in an overflow file the model is told the path to,
+    # so nothing is actually lost), but 2,000 tokens is small enough to
+    # bite on perfectly ordinary files. Raised, and now configurable.
+    tool_result_budget: int = 16_000
     reinject_every: int = 6
+
+    # Real bug, found live: no max_tokens was ever sent on a completion
+    # request at all, leaving each provider's own default output-length
+    # cap in charge — confirmed as the cause of a summary that started
+    # fine and then stopped mid-sentence. Generous by default; raise
+    # further if a specific model's own context size allows more.
+    max_output_tokens: int = 16_000
 
     # Economics (§11). On the free tier this ledger reads ~$0 — the real
     # ceiling is the rate limit below, not the dollar cap.
@@ -201,4 +214,6 @@ class Config:
             subagent_max_steps=int(os.getenv("GRANDICE_SUBAGENT_MAX_STEPS", "40")),
             embedding_model=os.getenv("GRANDICE_LLM_EMBEDDING_MODEL") or None,
             llm_timeout_seconds=float(os.getenv("GRANDICE_LLM_TIMEOUT_SECONDS", "60")),
+            tool_result_budget=int(os.getenv("GRANDICE_TOOL_RESULT_BUDGET", "16000")),
+            max_output_tokens=int(os.getenv("GRANDICE_MAX_OUTPUT_TOKENS", "16000")),
         )

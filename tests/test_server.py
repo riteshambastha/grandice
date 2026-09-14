@@ -82,6 +82,21 @@ def test_broadcaster_delivers_to_subscribers_and_keeps_bounded_history():
     assert b.history == [{"n": 2}, {"n": 3}]
 
 
+def test_broadcaster_default_history_is_generous():
+    """Real bug, found live: at the old 500-event cap, a single verbose turn
+    (many small streamed text_delta chunks plus tool calls) could evict the
+    *start* of that same turn from history before it even finished —
+    reopening the chat afterward replayed a response that looked like it
+    began somewhere in the middle."""
+    from grandice.server.broadcast import Broadcaster as BroadcasterClass
+
+    b = BroadcasterClass()  # the real default, not a test override
+    for i in range(2000):
+        b.publish({"type": "text_delta", "text": f"chunk {i}"})
+    assert len(b.history) == 2000  # nothing evicted
+    assert b.history[0] == {"type": "text_delta", "text": "chunk 0"}  # the start survived
+
+
 def test_unsubscribe_stops_delivery():
     b = Broadcaster()
     q = b.subscribe()
@@ -529,7 +544,7 @@ def _build_client_with_outward_tool(app, client) -> None:
         def __init__(self) -> None:
             self._n = 0
 
-        async def complete(self, model, messages, tools, temperature):
+        async def complete(self, model, messages, tools, temperature, max_tokens=None):
             self._n += 1
             if self._n == 1:
                 yield Reply(text="", tool_calls=[RC("1", "send_email", {"to": "a@b.c"})])

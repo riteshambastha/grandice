@@ -182,3 +182,34 @@ def test_llm_timeout_seconds_is_overridable(monkeypatch):
     monkeypatch.setenv("GRANDICE_LLM_TIMEOUT_SECONDS", "120")
     config = Config.from_env()
     assert config.llm_timeout_seconds == 120.0
+
+
+# --- max_output_tokens / tool_result_budget (§ response-truncation fix) ---
+#
+# Real bug found live: no max_tokens was ever sent on a completion request,
+# leaving the provider's own default output-length cap in charge — the
+# observed symptom was a summary that started fine and then stopped
+# mid-sentence. tool_result_budget (a large file's content, once read) had
+# the same "silently smaller than you'd expect" problem, and wasn't even
+# configurable via env before this.
+
+def test_max_output_tokens_has_a_generous_default(monkeypatch):
+    config = Config.from_env()
+    assert config.max_output_tokens >= 16_000
+
+
+def test_max_output_tokens_is_overridable(monkeypatch):
+    monkeypatch.setenv("GRANDICE_MAX_OUTPUT_TOKENS", "32000")
+    config = Config.from_env()
+    assert config.max_output_tokens == 32000
+
+
+def test_tool_result_budget_has_a_generous_default(monkeypatch):
+    config = Config.from_env()
+    assert config.tool_result_budget >= 16_000
+
+
+def test_tool_result_budget_is_overridable(monkeypatch):
+    monkeypatch.setenv("GRANDICE_TOOL_RESULT_BUDGET", "40000")
+    config = Config.from_env()
+    assert config.tool_result_budget == 40000

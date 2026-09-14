@@ -10,7 +10,16 @@ import asyncio
 from collections import deque
 from typing import Any
 
-HISTORY_LIMIT = 500
+# Real bug, found live: a single verbose turn (a long streamed reply, plus
+# several tool calls) can easily emit more than a few hundred events — a
+# provider that streams token-by-token turns even a moderate response into
+# hundreds of tiny text_delta events on its own. At the old 500-event cap,
+# reopening a chat (or an SSE reconnect after a network blip) could replay
+# a history missing the *start* of that turn, since publish() evicts the
+# oldest event once the deque is full — a coherent-looking response that
+# actually began somewhere in the middle. Each event is small (a short
+# JSON dict), so even a generous cap here costs only a few MB per chat.
+HISTORY_LIMIT = 20_000
 
 
 class Broadcaster:

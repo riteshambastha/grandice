@@ -97,6 +97,7 @@ class Backend:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         temperature: float,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[str | Reply]:
         raise NotImplementedError
 
@@ -122,7 +123,9 @@ class OpenAICompatBackend(Backend):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         temperature: float,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[str | Reply]:
+        import httpx
         from openai import (
             APIConnectionError,
             APITimeoutError,
@@ -134,9 +137,31 @@ class OpenAICompatBackend(Backend):
         attempt = 0
         while True:
             try:
-                async for item in self._stream_once(model, messages, tools, temperature):
+                async for item in self._stream_once(model, messages, tools, temperature, max_tokens):
                     yield item
                 return
+            except httpx.RemoteProtocolError as exc:
+                # Real bug, found live summarizing an uploaded CSV: the
+                # model was streaming a long response and the connection
+                # was cut mid-body ("peer closed connection without sending
+                # complete message body") — not any openai exception type,
+                # so it fell through to a generic, unhelpful "All backends
+                # failed" before this. This is the gateway (or the network
+                # path to it — a Tailscale tunnel included) dropping a
+                # long-running connection partway through, not a token or
+                # context limit on grandice's own side. No retry: the
+                # partial text already streamed to the client can't be
+                # cleanly un-shown, so retrying here would just append a
+                # second, overlapping attempt on top of it — surfacing this
+                # clearly and letting the user re-send is the honest option.
+                raise RuntimeError(
+                    f"{self.name} closed the connection before finishing this response "
+                    f"({_error_message(exc)}). This usually means the gateway (or the "
+                    f"network path to it) can't sustain a very long streaming response — try "
+                    f"asking for something more targeted (e.g. a summary instead of a full "
+                    f"row-by-row dump), or check the gateway's own request/timeout settings if "
+                    f"this keeps happening on long generations."
+                ) from exc
             except AuthenticationError as exc:
                 # HTTP 401 — the key itself, not the request, is the problem.
                 raise RuntimeError(
@@ -200,12 +225,14 @@ class OpenAICompatBackend(Backend):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         temperature: float,
+        max_tokens: int | None,
     ) -> AsyncIterator[str | Reply]:
         stream = await self._client.chat.completions.create(
             model=model,
             messages=messages,
             tools=tools or None,
             temperature=temperature,
+            max_tokens=max_tokens,
             stream=True,
             stream_options={"include_usage": True},
         )
@@ -311,6 +338,7 @@ class StubBackend(Backend):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         temperature: float,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[str | Reply]:
         self._turn += 1
         names = {t["function"]["name"] for t in tools}
@@ -406,7 +434,9 @@ class Router:
         last_error: Exception | None = None
         for backend in self.backends:
             try:
-                async for item in backend.complete(resolved_model, messages, tools or [], temp):
+                async for item in backend.complete(
+                    resolved_model, messages, tools or [], temp, self.config.max_output_tokens
+                ):
                     if isinstance(item, Reply):
                         self.ledger.record(tier, item.prompt_tokens, item.completion_tokens)
                     yield item

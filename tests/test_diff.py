@@ -77,7 +77,7 @@ async def test_run_turn_yields_file_changed_after_a_successful_write(session):
         def __init__(self):
             self._n = 0
 
-        async def complete(self, model, messages, tools, temperature):
+        async def complete(self, model, messages, tools, temperature, max_tokens=None):
             self._n += 1
             if self._n == 1:
                 yield Reply(text="", tool_calls=[ToolCall("1", "write", {"path": "note.txt", "content": "hi"})])
@@ -101,7 +101,7 @@ async def test_run_turn_does_not_diff_a_failed_write(session):
         def __init__(self):
             self._n = 0
 
-        async def complete(self, model, messages, tools, temperature):
+        async def complete(self, model, messages, tools, temperature, max_tokens=None):
             self._n += 1
             if self._n == 1:
                 # missing required "content" argument -> validation error

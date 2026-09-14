@@ -60,7 +60,7 @@ def test_daily_count_resets_on_a_new_day(tmp_path: Path):
 class _AlwaysFails(Backend):
     name = "flaky"
 
-    async def complete(self, model, messages, tools, temperature):
+    async def complete(self, model, messages, tools, temperature, max_tokens=None):
         raise ConnectionError("provider unreachable")
         yield  # pragma: no cover - unreachable, satisfies the async generator shape
 
@@ -244,6 +244,52 @@ async def test_connection_failure_mentions_tailscale(monkeypatch):
             pass
 
 
+async def test_mid_stream_disconnect_reports_a_clear_specific_error(monkeypatch):
+    """Real bug, found live summarizing an uploaded CSV: the model was
+    streaming a long response and the connection was cut mid-body — a raw
+    httpx.RemoteProtocolError, not any openai exception type, so it fell
+    through every existing except clause into a generic, unhelpful "All
+    backends failed" before this fix."""
+    import httpx
+
+    backend = _make_backend()
+
+    async def fake_stream_once(self, *a, **kw):
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body (incomplete chunked read)"
+        )
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(type(backend), "_stream_once", fake_stream_once)
+
+    with pytest.raises(RuntimeError, match="closed the connection before finishing"):
+        async for _ in backend.complete("chat", [], [], 0.2):
+            pass
+
+
+async def test_mid_stream_disconnect_does_not_retry(monkeypatch):
+    """No retry on purpose: the partial text already streamed to the client
+    can't be cleanly un-shown, so retrying would just append a second,
+    overlapping attempt on top of it rather than replacing it."""
+    import httpx
+
+    backend = _make_backend()
+    calls = []
+
+    async def fake_stream_once(self, *a, **kw):
+        calls.append(1)
+        raise httpx.RemoteProtocolError("peer closed connection")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(type(backend), "_stream_once", fake_stream_once)
+
+    with pytest.raises(RuntimeError):
+        async for _ in backend.complete("chat", [], [], 0.2):
+            pass
+
+    assert len(calls) == 1
+
+
 # --- Router.embed() ---------------------------------------------------------
 
 async def test_embed_requires_live_config():
@@ -311,7 +357,7 @@ async def test_complete_uses_the_tiers_model_by_default(monkeypatch):
     class _Capture(Backend):
         name = "capture"
 
-        async def complete(self, model, messages, tools, temperature):
+        async def complete(self, model, messages, tools, temperature, max_tokens=None):
             captured["model"] = model
             yield Reply(text="ok")
 
@@ -328,7 +374,7 @@ async def test_complete_model_override_wins_over_the_tier(monkeypatch):
     class _Capture(Backend):
         name = "capture"
 
-        async def complete(self, model, messages, tools, temperature):
+        async def complete(self, model, messages, tools, temperature, max_tokens=None):
             captured["model"] = model
             yield Reply(text="ok")
 
@@ -336,6 +382,64 @@ async def test_complete_model_override_wins_over_the_tier(monkeypatch):
     async for _ in router.complete(tier="orchestrator", messages=[], model="a-custom-alias"):
         pass
     assert captured["model"] == "a-custom-alias"
+
+
+# --- max_tokens actually reaches the completion request (§ response-
+# truncation fix) — real bug found live: this was never sent at all,
+# leaving the provider's own (in this case, too-small) default in charge -----
+
+async def test_complete_passes_configured_max_output_tokens_to_the_backend():
+    config = replace(
+        Config.from_env(), api_key="k", base_url="https://example.invalid", max_output_tokens=12345
+    )
+    captured = {}
+
+    class _Capture(Backend):
+        name = "capture"
+
+        async def complete(self, model, messages, tools, temperature, max_tokens=None):
+            captured["max_tokens"] = max_tokens
+            yield Reply(text="ok")
+
+    router = Router(config, backends=[_Capture()], rate_limiter=None)
+    async for _ in router.complete(tier="orchestrator", messages=[]):
+        pass
+    assert captured["max_tokens"] == 12345
+
+
+async def test_stream_once_includes_max_tokens_in_the_real_api_call(monkeypatch):
+    """Confirms the value actually lands in the openai SDK call, not just
+    somewhere inside our own code — that's the exact gap that let a
+    provider's own small default silently cap every response."""
+    from grandice.router import OpenAICompatBackend
+
+    backend = OpenAICompatBackend.__new__(OpenAICompatBackend)
+    backend.name = "test"
+    backend._timeout = 60.0
+
+    captured = {}
+
+    class FakeStream:
+        def __aiter__(self):
+            async def gen():
+                return
+                yield  # pragma: no cover
+            return gen()
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeStream()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    backend._client = type("FakeClient", (), {"chat": FakeChat()})()
+
+    async for _ in backend.complete("chat", [], [], 0.2, max_tokens=9999):
+        pass
+
+    assert captured["max_tokens"] == 9999
 
 
 # --- Router.list_models() ---------------------------------------------
