@@ -27,15 +27,21 @@ const $newChatBtn = document.getElementById("new-chat-btn");
 const $noChatNotice = document.getElementById("no-chat-notice");
 
 const $log = document.getElementById("log");
+const $planPanel = document.getElementById("plan-panel");
 const $planList = document.getElementById("plan-list");
 const $costPanel = document.getElementById("cost-panel");
 const $skillsList = document.getElementById("skills-list");
+const $skillsSummary = document.getElementById("skills-summary");
 const $toolsPanel = document.getElementById("tools-panel");
+const $toolsSummary = document.getElementById("tools-summary");
+const $tasksPanel = document.getElementById("tasks-panel");
 const $tasksList = document.getElementById("tasks-list");
 const $fileList = document.getElementById("file-list");
 const $breadcrumb = document.getElementById("file-breadcrumb");
 const $badgeLive = document.getElementById("badge-live");
-const $badgeRow = document.getElementById("badge-row");
+const $envPanel = document.getElementById("env-panel");
+const $detailsToggle = document.getElementById("details-toggle");
+const $detailsPanel = document.getElementById("details-panel");
 const $taskForm = document.getElementById("task-form");
 const $taskInput = document.getElementById("task-input");
 const $sendBtn = document.getElementById("send-btn");
@@ -336,11 +342,15 @@ function resetDashboard() {
   openToolEntry = null;
   approvalQueue = [];
   $approvalModal.classList.add("hidden");
-  $planList.innerHTML = '<li class="muted">No plan yet.</li>';
+  $planList.innerHTML = "";
+  $planPanel.classList.add("hidden");
   $costPanel.innerHTML = "";
   $skillsList.innerHTML = "";
+  $skillsSummary.textContent = "";
   $toolsPanel.innerHTML = "";
+  $toolsSummary.textContent = "";
   $tasksList.innerHTML = "";
+  $tasksPanel.classList.add("hidden");
   $fileList.innerHTML = "";
   $breadcrumb.innerHTML = "";
   currentDir = ".";
@@ -367,26 +377,23 @@ function renderState(state) {
   $badgeLive.textContent = state.live ? "live" : "stub";
   $badgeLive.className = "badge " + (state.live ? "live" : "stub");
 
-  $badgeRow.innerHTML = "";
+  $envPanel.innerHTML = "";
   for (const text of [state.model.orchestrator, state.sandbox]) {
     const span = document.createElement("span");
     span.className = "badge";
     span.textContent = text;
-    $badgeRow.appendChild(span);
+    $envPanel.appendChild(span);
   }
 
   setRunning(state.running);
 
+  $planPanel.classList.toggle("hidden", !state.plan.length);
   $planList.innerHTML = "";
-  if (!state.plan.length) {
-    $planList.innerHTML = '<li class="muted">No plan yet.</li>';
-  } else {
-    for (const item of state.plan) {
-      const li = document.createElement("li");
-      li.className = item.status;
-      li.innerHTML = `<span class="plan-mark">${planMark(item.status)}</span><span>${escapeHtml(item.task)}</span>`;
-      $planList.appendChild(li);
-    }
+  for (const item of state.plan) {
+    const li = document.createElement("li");
+    li.className = item.status;
+    li.innerHTML = `<span class="plan-mark">${planMark(item.status)}</span><span>${escapeHtml(item.task)}</span>`;
+    $planList.appendChild(li);
   }
 
   const c = state.cost;
@@ -407,6 +414,7 @@ function renderState(state) {
   }
   $costPanel.innerHTML = html;
 
+  $skillsSummary.textContent = state.skills.length ? `${state.skills.length} installed` : "none installed";
   $skillsList.innerHTML = state.skills.length
     ? state.skills.map(s => `<li><span class="skill-name">${escapeHtml(s.name)}</span><span class="skill-desc">${escapeHtml(s.description)}</span></li>`).join("")
     : '<li class="muted">None installed.</li>';
@@ -417,20 +425,20 @@ function renderState(state) {
   const latentLine = state.tools.latent.length
     ? `Latent (via search_tools): ${state.tools.latent.join(", ")}`
     : "No latent tools waiting to be activated.";
+  $toolsSummary.textContent = `${state.tools.active.length} active`;
   $toolsPanel.innerHTML = `
     <div class="muted">${escapeHtml(connectorsLine)}</div>
     <div style="margin-top:6px">${escapeHtml(state.tools.active.join(", "))}</div>
     <div class="muted" style="margin-top:6px">${escapeHtml(latentLine)}</div>`;
 
-  $tasksList.innerHTML = state.tasks.length
-    ? state.tasks.map(t => {
-        const body = t.status === "done" ? t.result : t.status === "failed" ? t.error : null;
-        return `<li>
-          <div><span class="task-status ${t.status}">${t.status}</span> ${escapeHtml(t.description)}</div>
-          ${body ? `<div class="task-body">${escapeHtml(body)}</div>` : ""}
-        </li>`;
-      }).join("")
-    : '<li class="muted">No background tasks yet.</li>';
+  $tasksPanel.classList.toggle("hidden", !state.tasks.length);
+  $tasksList.innerHTML = state.tasks.map(t => {
+    const body = t.status === "done" ? t.result : t.status === "failed" ? t.error : null;
+    return `<li>
+      <div><span class="task-status ${t.status}">${t.status}</span> ${escapeHtml(t.description)}</div>
+      ${body ? `<div class="task-body">${escapeHtml(body)}</div>` : ""}
+    </li>`;
+  }).join("");
 }
 
 function setRunning(running) {
@@ -879,6 +887,41 @@ function connect() {
     // EventSource retries on its own; nothing to do here.
   };
   eventSource = source;
+}
+
+// --- details panel (dev-facing detail, opt-in via the topbar toggle) ------
+
+// A plain end user never needs to see cost/skills/tools telemetry; this
+// stays out of the way until asked for, and remembers the choice per
+// browser so it doesn't have to be re-opened on every reload.
+const DETAILS_OPEN_KEY = "grandice.detailsOpen";
+
+function setDetailsOpen(open) {
+  $detailsPanel.classList.toggle("hidden", !open);
+  $detailsToggle.classList.toggle("active", open);
+  try {
+    localStorage.setItem(DETAILS_OPEN_KEY, open ? "1" : "0");
+  } catch {
+    /* private browsing / blocked storage — the toggle still works this session */
+  }
+}
+
+$detailsToggle.onclick = () => setDetailsOpen($detailsPanel.classList.contains("hidden"));
+
+let detailsOpenDefault = false;
+try {
+  detailsOpenDefault = localStorage.getItem(DETAILS_OPEN_KEY) === "1";
+} catch {
+  /* ignore — default closed */
+}
+setDetailsOpen(detailsOpenDefault);
+
+for (const header of document.querySelectorAll(".collapsible-header")) {
+  const target = document.getElementById(header.dataset.target);
+  header.onclick = () => {
+    target.classList.toggle("hidden");
+    header.classList.toggle("expanded", !target.classList.contains("hidden"));
+  };
 }
 
 // --- boot -----------------------------------------------------------------

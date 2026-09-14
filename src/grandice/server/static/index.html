@@ -12,7 +12,7 @@
        so never even saw it. A version query string is a different cache
        key outright, not dependent on any intermediary honoring a header —
        bump it whenever style.css/app.js actually change. -->
-  <link rel="stylesheet" href="style.css?v=2" />
+  <link rel="stylesheet" href="style.css?v=3" />
 </head>
 <body>
   <div id="auth-screen" class="auth-screen">
@@ -38,10 +38,10 @@
         <span id="badge-live" class="badge">…</span>
       </div>
       <div class="topbar-right">
-        <div id="badge-row" class="badge-row"></div>
         <select id="model-select" class="model-select" disabled title="Model for this chat">
           <option value="">model…</option>
         </select>
+        <button type="button" id="details-toggle" class="details-toggle" title="Show activity, skills, cost">Details</button>
         <span id="whoami" class="whoami"></span>
         <button id="logout-btn">Log out</button>
       </div>
@@ -89,36 +89,60 @@
       </section>
 
       <aside class="sidebar">
-        <section class="panel">
+        <!-- Plan: only relevant while something is actually in progress —
+             rendered dynamically, this section stays out of the DOM
+             entirely (not just visually hidden) when there's no plan yet,
+             rather than permanently showing "No plan yet." as furniture. -->
+        <section class="panel hidden" id="plan-panel">
           <h2>Plan</h2>
-          <ul id="plan-list" class="plan-list"><li class="muted">No plan yet.</li></ul>
+          <ul id="plan-list" class="plan-list"></ul>
         </section>
 
-        <section class="panel">
-          <h2>Cost &amp; rate limit</h2>
-          <div id="cost-panel"></div>
-        </section>
-
-        <section class="panel">
-          <h2>Skills</h2>
-          <ul id="skills-list" class="skills-list"></ul>
-        </section>
-
-        <section class="panel">
-          <h2>Tools &amp; connectors</h2>
-          <div id="tools-panel"></div>
-        </section>
-
-        <section class="panel">
+        <!-- Background tasks: same "don't show it when there's nothing to
+             show" treatment as Plan. -->
+        <section class="panel hidden" id="tasks-panel">
           <h2>Background tasks</h2>
           <ul id="tasks-list" class="tasks-list"></ul>
         </section>
 
         <section class="panel files-panel">
-          <h2>Workspace</h2>
+          <h2>Files</h2>
           <div id="file-breadcrumb" class="breadcrumb"></div>
           <ul id="file-list" class="file-list"></ul>
         </section>
+
+        <!-- Everything below here is real, but it's implementation detail
+             a person asking the model to do something doesn't need in
+             front of them by default — the "Details" topbar toggle shows
+             this section for anyone who does want it (debugging, curiosity
+             about cost, checking which skills/tools are active). -->
+        <div id="details-panel" class="hidden">
+          <section class="panel">
+            <h2>Environment</h2>
+            <div id="env-panel" class="env-panel"></div>
+          </section>
+
+          <section class="panel">
+            <h2>Cost &amp; rate limit</h2>
+            <div id="cost-panel"></div>
+          </section>
+
+          <section class="panel collapsible-panel">
+            <button type="button" class="collapsible-header" data-target="skills-list">
+              <h2>Skills</h2>
+              <span id="skills-summary" class="muted"></span>
+            </button>
+            <ul id="skills-list" class="skills-list hidden"></ul>
+          </section>
+
+          <section class="panel collapsible-panel">
+            <button type="button" class="collapsible-header" data-target="tools-panel">
+              <h2>Tools &amp; connectors</h2>
+              <span id="tools-summary" class="muted"></span>
+            </button>
+            <div id="tools-panel" class="hidden"></div>
+          </section>
+        </div>
       </aside>
     </main>
   </div>
@@ -178,6 +202,6 @@
        sanitizes it first, since that text ultimately comes from a model. -->
   <script src="vendor/marked.min.js"></script>
   <script src="vendor/purify.min.js"></script>
-  <script src="app.js?v=2"></script>
+  <script src="app.js?v=3"></script>
 </body>
 </html>

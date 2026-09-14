@@ -52,8 +52,8 @@ body {
 .badge.live { background: var(--good-2); color: var(--good); }
 .badge.stub { background: var(--warn-2); color: var(--warn); }
 
-.badge-row { display: flex; gap: 8px; }
-.badge-row .badge { background: var(--sunk); color: var(--ink-3); }
+.env-panel { display: flex; gap: 8px; flex-wrap: wrap; }
+.env-panel .badge { background: var(--sunk); color: var(--ink-3); }
 
 .hidden { display: none !important; }
 
@@ -113,6 +113,41 @@ body {
   max-width: 160px;
 }
 .model-select:disabled { opacity: 0.4; }
+
+.details-toggle {
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--rule);
+  background: transparent;
+  color: var(--ink-3);
+}
+.details-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+.details-toggle.active { background: var(--sunk); color: var(--accent); border-color: var(--accent); }
+
+.collapsible-panel { padding-bottom: 8px; }
+.collapsible-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+}
+.panel .collapsible-header h2 { margin: 0; }
+.collapsible-header::after {
+  content: "▸";
+  color: var(--ink-3);
+  font-size: 11px;
+  margin-left: 8px;
+}
+.collapsible-header.expanded::after { content: "▾"; }
+.collapsible-header .muted { font-size: 11px; }
 
 .layout {
   display: grid;
