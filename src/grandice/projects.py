@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+DEFAULT_CHAT_TITLE = "New chat"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -140,19 +142,20 @@ class ProjectStore:
 
     # --- chats ----------------------------------------------------------
 
-    def create_chat(self, project_id: str, user_id: str, title: str = "New chat") -> Chat:
+    def create_chat(self, project_id: str, user_id: str, title: str = DEFAULT_CHAT_TITLE) -> Chat:
         chat_id = uuid.uuid4().hex[:12]
         now = time.time()
+        title = title.strip() or DEFAULT_CHAT_TITLE
         with self._lock:
             self.get_project(project_id, user_id)  # raises NotFound if not this user's project
             self._conn.execute(
                 "INSERT INTO chats (id, project_id, user_id, title, messages_json, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, '[]', ?, ?)",
-                (chat_id, project_id, user_id, title.strip() or "New chat", now, now),
+                (chat_id, project_id, user_id, title, now, now),
             )
             self._conn.commit()
         return Chat(id=chat_id, project_id=project_id, user_id=user_id,
-                    title=title.strip() or "New chat", created_at=now, updated_at=now, model=None)
+                    title=title, created_at=now, updated_at=now, model=None)
 
     def list_chats(self, project_id: str, user_id: str) -> list[Chat]:
         with self._lock:
@@ -204,7 +207,7 @@ class ProjectStore:
             self.get_chat(chat_id, user_id)
             self._conn.execute(
                 "UPDATE chats SET title = ?, updated_at = ? WHERE id = ?",
-                (title.strip() or "New chat", time.time(), chat_id),
+                (title.strip() or DEFAULT_CHAT_TITLE, time.time(), chat_id),
             )
             self._conn.commit()
 

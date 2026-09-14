@@ -221,6 +221,92 @@ def test_rename_chat(client):
     assert res.json()["title"] == "renamed"
 
 
+# --- auto-titling a chat's first message -----------------------------------
+#
+# Real request: every new chat sat at "New chat" forever unless renamed by
+# hand (double-click), which most people never discover — asked for
+# something that renames itself automatically, plus a timestamp and a
+# delete option (delete/rename already existed, just not very discoverable;
+# see the CSS/JS changes alongside this for that half).
+
+def test_auto_title_collapses_whitespace_and_truncates():
+    from grandice.projects import DEFAULT_CHAT_TITLE
+    from grandice.server.app import _auto_title
+
+    assert _auto_title("  hello   world  \n") == "hello world"
+    assert _auto_title("   ") == DEFAULT_CHAT_TITLE
+
+    long_title = _auto_title("word " * 30)
+    assert long_title.endswith("…")
+    assert len(long_title) <= 61  # 60-char limit + the ellipsis (rstrip may trim below that)
+
+
+def _project_and_default_chat(client) -> tuple[str, str]:
+    """Like _project_and_chat, but leaves the chat at DEFAULT_CHAT_TITLE
+    instead of giving it an explicit title — what a real "+" click does."""
+    project = client.post("/api/projects", json={"name": "demo"}).json()
+    chat = client.post(f"/api/projects/{project['id']}/chats", json={}).json()
+    return project["id"], chat["id"]
+
+
+def _wait_until_idle(client, chat_id: str) -> None:
+    for _ in range(50):
+        if not client.get(f"/api/chats/{chat_id}/state").json()["running"]:
+            return
+        time.sleep(0.02)
+
+
+def test_first_message_auto_titles_a_still_default_chat(client):
+    from grandice.projects import DEFAULT_CHAT_TITLE
+
+    _register(client)
+    project_id, chat_id = _project_and_default_chat(client)
+
+    message = "Please summarize this quarter's spend and " + "flag anything unusual " * 4
+    assert client.post(f"/api/chats/{chat_id}/task", json={"message": message}).status_code == 202
+    _wait_until_idle(client, chat_id)
+
+    chats = client.get(f"/api/projects/{project_id}/chats").json()
+    chat = next(c for c in chats if c["id"] == chat_id)
+    assert chat["title"] != DEFAULT_CHAT_TITLE
+    assert chat["title"].startswith("Please summarize this quarter's spend and")
+
+
+def test_first_message_does_not_override_a_title_already_set(client):
+    """A chat renamed (by hand, or by an earlier auto-title) before its
+    first message is never overwritten — only a chat still sitting at the
+    literal default gets auto-titled."""
+    _register(client)
+    project_id, chat_id = _project_and_chat(client)  # created with title "chat 1"
+
+    assert client.post(f"/api/chats/{chat_id}/task", json={"message": "hello there"}).status_code == 202
+    _wait_until_idle(client, chat_id)
+
+    chats = client.get(f"/api/projects/{project_id}/chats").json()
+    assert next(c for c in chats if c["id"] == chat_id)["title"] == "chat 1"
+
+
+def test_a_second_message_does_not_re_title_an_already_named_chat(client):
+    """Auto-titling fires once, on the first message only — a chat already
+    renamed by the auto-title itself must not keep changing on later turns."""
+    _register(client)
+    project_id, chat_id = _project_and_default_chat(client)
+
+    assert client.post(f"/api/chats/{chat_id}/task", json={"message": "first message here"}).status_code == 202
+    _wait_until_idle(client, chat_id)
+    first_title = next(
+        c for c in client.get(f"/api/projects/{project_id}/chats").json() if c["id"] == chat_id
+    )["title"]
+
+    assert client.post(f"/api/chats/{chat_id}/task", json={"message": "a completely different second message"}).status_code == 202
+    _wait_until_idle(client, chat_id)
+    second_title = next(
+        c for c in client.get(f"/api/projects/{project_id}/chats").json() if c["id"] == chat_id
+    )["title"]
+
+    assert first_title == second_title
+
+
 def test_new_chat_has_no_model_override(client):
     _register(client)
     _, chat_id = _project_and_chat(client)

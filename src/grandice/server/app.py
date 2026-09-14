@@ -32,7 +32,7 @@ from .. import loop as agent_loop
 from ..accounts import AccountStore, InvalidCredentials, UsernameTaken, User
 from ..config import Config
 from ..permissions import Gate
-from ..projects import Chat, NotFound, ProjectStore
+from ..projects import DEFAULT_CHAT_TITLE, Chat, NotFound, ProjectStore
 from ..session import Session, build as build_session, start_connectors, stop_connectors
 from .broadcast import Broadcaster
 from .serialize import event_to_dict
@@ -87,7 +87,7 @@ class ProjectIn(BaseModel):
 
 
 class ChatIn(BaseModel):
-    title: str = "New chat"
+    title: str = DEFAULT_CHAT_TITLE
 
 
 class ChatUpdateIn(BaseModel):
@@ -463,9 +463,28 @@ def _save_upload(session: Session, original_name: str, data: bytes) -> str:
     return str(candidate.relative_to(session.sandbox.workspace))
 
 
+_AUTO_TITLE_LIMIT = 60
+
+
+def _auto_title(message: str) -> str:
+    """A short title from a chat's first message — plain truncation, not a
+    model call: it's free, instant, and good enough for a list label that's
+    always one rename away from something better. Only ever applied once,
+    to a chat still sitting at DEFAULT_CHAT_TITLE (see _run below) — a
+    title the user picked, by hand or from an earlier auto-title, is never
+    overwritten."""
+    collapsed = " ".join(message.split())
+    if not collapsed:
+        return DEFAULT_CHAT_TITLE
+    if len(collapsed) <= _AUTO_TITLE_LIMIT:
+        return collapsed
+    return collapsed[:_AUTO_TITLE_LIMIT].rstrip() + "…"
+
+
 async def _run(
     state: AppState, chat: Chat, runtime: ChatRuntime, message: str, attachments: list[str]
 ) -> None:
+    is_first_message = not runtime.session.messages
     try:
         async for event in agent_loop.run_turn(
             runtime.session, message, model=chat.model, attachments=attachments
@@ -476,6 +495,8 @@ async def _run(
         # A chat's whole point is resuming exactly where it left off — save
         # after every turn, not just on a clean shutdown.
         state.projects.save_messages(chat.id, chat.user_id, runtime.session.messages)
+        if is_first_message and chat.title == DEFAULT_CHAT_TITLE:
+            state.projects.rename_chat(chat.id, chat.user_id, _auto_title(message))
         # Plan/cost/files may all have changed; tell the UI to refetch rather
         # than trying to diff every field into an event of its own.
         runtime.broadcaster.publish({"type": "state_changed"})

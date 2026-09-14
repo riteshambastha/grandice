@@ -214,6 +214,21 @@ function renderProjectList() {
   }
 }
 
+// A short, then-absolute-once-old timestamp — same shape as most chat UIs
+// (a few minutes/hours as "Nm/Nh ago", then a plain date once it's not
+// today's activity anymore). The exact moment is still one hover away via
+// the element's own `title` attribute, set alongside this in renderChatList.
+function formatChatTimestamp(unixSeconds) {
+  const date = new Date(unixSeconds * 1000);
+  const diffMin = (Date.now() - date.getTime()) / 60000;
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${Math.floor(diffMin)}m ago`;
+  if (diffMin < 24 * 60) return `${Math.floor(diffMin / 60)}h ago`;
+  if (diffMin < 7 * 24 * 60) return `${Math.floor(diffMin / (24 * 60))}d ago`;
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: sameYear ? undefined : "numeric" });
+}
+
 function renderChatList() {
   $chatList.innerHTML = "";
   $newChatBtn.disabled = !currentProjectId;
@@ -227,10 +242,15 @@ function renderChatList() {
   }
   for (const c of chats) {
     const li = document.createElement("li");
-    li.className = "nav-item" + (c.id === currentChatId ? " active" : "");
-    li.innerHTML = `<span class="nav-item-label">${escapeHtml(c.title)}</span><button class="nav-item-delete" title="Delete chat">×</button>`;
-    li.querySelector(".nav-item-label").onclick = () => selectChat(c.id);
-    li.querySelector(".nav-item-label").ondblclick = async () => {
+    li.className = "nav-item chat-item" + (c.id === currentChatId ? " active" : "");
+    li.innerHTML = `
+      <div class="nav-item-main" title="Double-click to rename">
+        <span class="nav-item-label">${escapeHtml(c.title)}</span>
+        <span class="nav-item-meta" title="${escapeHtml(new Date(c.updated_at * 1000).toLocaleString())}">${formatChatTimestamp(c.updated_at)}</span>
+      </div>
+      <button class="nav-item-delete" title="Delete chat">×</button>`;
+    li.querySelector(".nav-item-main").onclick = () => selectChat(c.id);
+    li.querySelector(".nav-item-main").ondblclick = async () => {
       const title = await showPrompt("Rename chat", c.title);
       if (!title || title === c.title) return;
       await fetch(`/api/chats/${c.id}`, {
@@ -275,6 +295,18 @@ async function loadChats(projectId) {
   if (!currentChatId && chats.length) currentChatId = chats[0].id;
   renderChatList();
   await selectChat(currentChatId);
+}
+
+// Re-fetches just the chat list's own data (a title from auto-titling, a
+// bumped last-activity timestamp) without touching the selection or
+// disturbing the live connection the way loadChats' selectChat(...) call
+// would — this runs on every `state_changed` event, i.e. potentially
+// mid-stream on the very SSE connection that's delivering it.
+async function refreshChatList() {
+  if (!currentProjectId) return;
+  const res = await fetch(`/api/projects/${currentProjectId}/chats`);
+  chats = await res.json();
+  renderChatList();
 }
 
 async function selectProject(projectId) {
@@ -576,6 +608,7 @@ function handleEvent(ev) {
     case "state_changed": {
       refreshState();
       refreshFiles(currentDir);
+      refreshChatList();
       break;
     }
   }
