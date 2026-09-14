@@ -545,6 +545,10 @@ function addUserMessage(text, attachments) {
 
 function handleEvent(ev) {
   switch (ev.type) {
+    case "user_message": {
+      addUserMessage(ev.text, ev.attachments);
+      break;
+    }
     case "text_delta": {
       if (!streamingText) {
         streamingText = document.createElement("div");
@@ -890,7 +894,11 @@ $taskForm.onsubmit = async (e) => {
     setTimeout(() => $taskError.classList.add("hidden"), 4000);
     return;
   }
-  addUserMessage(message, attachments);
+  // No local echo here — the server publishes a "user_message" event
+  // (handleEvent below) the moment the turn actually starts, and that's
+  // now the ONLY place this ever renders, so it's also what a page reload
+  // replays. A local echo used to do this instead, which never made it
+  // into the replayable log — see _run()'s own comment in server/app.py.
   $taskInput.value = "";
   pendingAttachments = [];
   renderAttachmentChips();

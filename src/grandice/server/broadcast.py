@@ -23,9 +23,15 @@ HISTORY_LIMIT = 20_000
 
 
 class Broadcaster:
-    def __init__(self, history_limit: int = HISTORY_LIMIT) -> None:
+    def __init__(
+        self, history_limit: int = HISTORY_LIMIT, history: list[dict[str, Any]] | None = None
+    ) -> None:
         self._subscribers: list[asyncio.Queue[dict[str, Any]]] = []
-        self._history: deque[dict[str, Any]] = deque(maxlen=history_limit)
+        # Pre-seeded from a previous process's persisted log (server/app.py's
+        # _build_runtime) — a fresh Broadcaster otherwise starts blank even
+        # though the chat's real conversation (session.messages) survives a
+        # restart just fine; see ProjectStore.load_log's own comment.
+        self._history: deque[dict[str, Any]] = deque(history or (), maxlen=history_limit)
 
     @property
     def history(self) -> list[dict[str, Any]]:

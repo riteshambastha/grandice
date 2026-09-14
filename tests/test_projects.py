@@ -113,6 +113,38 @@ def test_save_messages_is_blocked_for_a_non_owner(store: ProjectStore):
     assert store.load_messages(c.id, "u1") == []  # untouched
 
 
+# The rendered event log (server/app.py's dashboard event shapes) is
+# deliberately separate from messages_json above — it's what makes a chat's
+# VISIBLE transcript, not just the model's own memory of it, survive a
+# server restart. See ProjectStore.load_log's own comment for the bug this
+# fixes: without it, session.messages reloaded fine but a freshly built
+# Broadcaster started blank, so a chat looked like it had forgotten
+# everything even though the model still remembered.
+
+def test_load_log_defaults_to_empty(store: ProjectStore):
+    p = store.create_project("u1", "mine")
+    c = store.create_chat(p.id, "u1")
+    assert store.load_log(c.id, "u1") == []
+
+
+def test_save_then_load_log_round_trips(store: ProjectStore):
+    p = store.create_project("u1", "mine")
+    c = store.create_chat(p.id, "u1")
+    events = [{"type": "text_delta", "text": "hi"}, {"type": "finished", "reason": "done"}]
+
+    store.save_log(c.id, "u1", events)
+
+    assert store.load_log(c.id, "u1") == events
+
+
+def test_save_log_is_blocked_for_a_non_owner(store: ProjectStore):
+    p = store.create_project("u1", "mine")
+    c = store.create_chat(p.id, "u1")
+    with pytest.raises(NotFound):
+        store.save_log(c.id, "u2", [{"type": "text_delta", "text": "sneaky"}])
+    assert store.load_log(c.id, "u1") == []  # untouched
+
+
 def test_rename_chat(store: ProjectStore):
     p = store.create_project("u1", "mine")
     c = store.create_chat(p.id, "u1", "old title")

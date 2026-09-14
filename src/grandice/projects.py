@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS chats (
     messages_json TEXT NOT NULL DEFAULT '[]',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    model TEXT
+    model TEXT,
+    log_json TEXT NOT NULL DEFAULT '[]'
 );
 """
 
@@ -91,6 +92,8 @@ class ProjectStore:
         existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(chats)")}
         if "model" not in existing:
             self._conn.execute("ALTER TABLE chats ADD COLUMN model TEXT")
+        if "log_json" not in existing:
+            self._conn.execute("ALTER TABLE chats ADD COLUMN log_json TEXT NOT NULL DEFAULT '[]'")
         self._conn.commit()
         # Real bug, caught live in accounts.py's identical pattern (see its
         # own comment): this one shared sqlite3.Connection is genuinely
@@ -199,6 +202,30 @@ class ProjectStore:
             self._conn.execute(
                 "UPDATE chats SET messages_json = ?, updated_at = ? WHERE id = ?",
                 (json.dumps(messages, default=str), time.time(), chat_id),
+            )
+            self._conn.commit()
+
+    def load_log(self, chat_id: str, user_id: str) -> list[dict[str, Any]]:
+        """The rendered event log (text_delta/tool_started/tool_finished/...
+        — the dashboard's own event shapes, NOT messages_json's router
+        format), separate from load_messages because it's for redisplay,
+        not for the model's own context. Without this, a chat's actual
+        context survives a server restart just fine (session.messages
+        reloads from messages_json), but the visible transcript in a freshly
+        rebuilt ChatRuntime's Broadcaster does not — everything BEFORE that
+        restart looked like it had been forgotten, even though the model
+        itself still remembered and would prove it the moment you asked."""
+        with self._lock:
+            self.get_chat(chat_id, user_id)
+            row = self._conn.execute("SELECT log_json FROM chats WHERE id = ?", (chat_id,)).fetchone()
+        return json.loads(row["log_json"])
+
+    def save_log(self, chat_id: str, user_id: str, events: list[dict[str, Any]]) -> None:
+        with self._lock:
+            self.get_chat(chat_id, user_id)
+            self._conn.execute(
+                "UPDATE chats SET log_json = ? WHERE id = ?",
+                (json.dumps(events, default=str), chat_id),
             )
             self._conn.commit()
 

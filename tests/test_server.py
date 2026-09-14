@@ -489,6 +489,13 @@ def test_task_with_an_attachment_mentions_it_in_the_stored_message(client):
     messages = grandice_state.runtimes[chat_id].session.messages
     assert "notes.txt" in messages[0]["content"]
 
+    # The replayable transcript's own user_message event needs the file
+    # name too — it's a separate rendering of the same turn, not derived
+    # from the message above at display time.
+    log = client.get(f"/api/chats/{chat_id}/log").json()
+    assert log[0]["type"] == "user_message"
+    assert log[0]["attachments"] == [{"name": "notes.txt"}]
+
 
 def test_files_lists_the_workspace_root(client):
     _register(client)
@@ -571,6 +578,11 @@ def test_a_real_task_streams_events_updates_state_and_persists_messages(client):
 
     log = client.get(f"/api/chats/{chat_id}/log").json()
     types = [e["type"] for e in log]
+    # The turn's own user message is now a real, replayable event — not
+    # just a local-only echo the old frontend rendered on submit and never
+    # sent anywhere — so it must be first, not merely present somewhere.
+    assert types[0] == "user_message"
+    assert log[0]["text"] == "list the workspace"
     assert "tool_started" in types
     assert "tool_finished" in types
     assert "finished" in types
@@ -587,6 +599,16 @@ def test_a_real_task_streams_events_updates_state_and_persists_messages(client):
     messages = client.get(f"/api/chats/{chat_id}/state").json()
     assert messages["session_id"]  # runtime rebuilt without error
     assert len(grandice_state.runtimes[chat_id].session.messages) > 0
+
+    # Real bug: session.messages (the model's own memory) survived a fresh
+    # runtime just fine even before this was fixed, but the VISIBLE
+    # transcript did not — a brand-new Broadcaster started blank, so a
+    # reopened chat looked like it had forgotten everything even though the
+    # model itself still remembered. The replayed /log must carry the same
+    # tool_started/tool_finished/finished events from before the "restart",
+    # not just whatever happens from here on.
+    log_after_restart = client.get(f"/api/chats/{chat_id}/log").json()
+    assert [e["type"] for e in log_after_restart] == types
 
 
 def test_deleting_a_chat_evicts_its_live_runtime(client):

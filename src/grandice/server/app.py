@@ -383,7 +383,12 @@ async def _resolve(state: AppState, chat_id: str, user: User) -> tuple[Chat, Cha
 
 
 async def _build_runtime(state: AppState, chat: Chat) -> ChatRuntime:
-    broadcaster = Broadcaster()
+    # Restores the VISIBLE transcript, not just the model's own memory of it
+    # (that part — session.messages below — always survived a restart fine).
+    # Without this, reopening a chat after the server restarted showed a
+    # blank log even though the model still remembered everything, which
+    # read exactly like the chat had forgotten its own history.
+    broadcaster = Broadcaster(history=state.projects.load_log(chat.id, chat.user_id))
     pending_approvals: dict[str, asyncio.Future] = {}
 
     async def web_ask(payload: str) -> bool:
@@ -485,6 +490,18 @@ async def _run(
     state: AppState, chat: Chat, runtime: ChatRuntime, message: str, attachments: list[str]
 ) -> None:
     is_first_message = not runtime.session.messages
+    # Published here, not rendered client-side on submit (the frontend used
+    # to do exactly that): a purely local echo is never part of the
+    # replayable log below, so — real bug, found live — a chat's OWN
+    # messages vanished from the visible transcript on every single reload,
+    # not just a server restart, even though the model's actual memory of
+    # them (session.messages) was always fine. This is now the one and only
+    # place a user turn is ever rendered, so there's nothing to double up.
+    runtime.broadcaster.publish({
+        "type": "user_message",
+        "text": message,
+        "attachments": [{"name": Path(a).name} for a in attachments],
+    })
     try:
         async for event in agent_loop.run_turn(
             runtime.session, message, model=chat.model, attachments=attachments
@@ -500,6 +517,9 @@ async def _run(
         # Plan/cost/files may all have changed; tell the UI to refetch rather
         # than trying to diff every field into an event of its own.
         runtime.broadcaster.publish({"type": "state_changed"})
+        # The VISIBLE transcript, saved separately from messages_json above —
+        # see _build_runtime's own comment for why this is its own column.
+        state.projects.save_log(chat.id, chat.user_id, runtime.broadcaster.history)
 
 
 async def _poll_tasks(state: AppState) -> None:
