@@ -13,7 +13,7 @@ import pytest
 
 from grandice.config import Config
 from grandice.ratelimit import DailyCapReached, RateLimiter
-from grandice.router import Backend, Reply, Router, StubBackend
+from grandice.router import Backend, Reply, Router, StubBackend, ToolCall
 
 
 # --- RateLimiter ---------------------------------------------------------
@@ -492,3 +492,28 @@ async def test_list_models_falls_back_if_the_provider_endpoint_errors(monkeypatc
 
     models = await router.list_models()
     assert set(models) == {config.tiers.orchestrator, config.tiers.worker, config.tiers.bulk}
+
+
+# §05 — Reply.message's exact shape matters: it's what gets persisted into
+# session.messages and sent back as history on every later turn. Real bug,
+# found live: `content: None` with no tool_calls is a degenerate assistant
+# turn (neither content nor a tool call) that a self-hosted model (Ollama-
+# served qwen3:8b, confirmed live) chokes on — once that turn is in history,
+# every later completion in the same chat also comes back empty. See
+# test_hardening.py's test_empty_reply_does_not_poison_the_transcript_with_a_null_turn
+# for the end-to-end version of this through run_turn.
+def test_message_uses_empty_string_not_none_when_reply_is_genuinely_empty():
+    assert Reply(text="", tool_calls=[]).message["content"] == ""
+
+
+def test_message_keeps_none_for_a_pure_tool_call_reply():
+    """The standard, well-formed "said nothing, just called a tool" shape
+    must still use `content: None` — only the fully-empty case above changed."""
+    reply = Reply(text="", tool_calls=[ToolCall("1", "glob", {"pattern": "*"})])
+    assert reply.message["content"] is None
+    assert reply.message["tool_calls"][0]["function"]["name"] == "glob"
+
+
+def test_message_keeps_real_text_even_alongside_tool_calls():
+    reply = Reply(text="Checking now.", tool_calls=[ToolCall("1", "glob", {"pattern": "*"})])
+    assert reply.message["content"] == "Checking now."

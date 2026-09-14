@@ -232,3 +232,27 @@ async def test_a_normal_text_only_reply_still_says_done(session):
     events = [e async for e in agent_loop.run_turn(session, "hello")]
     finished = [e for e in events if isinstance(e, agent_loop.Finished)][0]
     assert finished.reason == "done"
+
+
+# Real bug, found live right after the fix above shipped: flagging an empty
+# reply is useless if the reply itself then poisons the transcript. Reply.
+# message used to store `content: None` whenever there was no tool_calls —
+# including this exact empty case — producing a `{"role": "assistant",
+# "content": None}` turn with neither content nor a tool call. Sent back to
+# a self-hosted model (confirmed live on Ollama-served qwen3:8b) as history,
+# THAT degenerate turn broke its chat template outright: every following
+# completion in the same chat also came back empty, in ~200ms, no matter
+# what the user sent next — "try rephrasing, or send another message" could
+# never actually recover the conversation. The fix is in Reply.message
+# itself (router.py): fall back to "" instead of None when there's no
+# tool_calls, so the persisted turn is always well-formed.
+async def test_empty_reply_does_not_poison_the_transcript_with_a_null_turn(session):
+    session.router.backends = [_StubReplyBackend(Reply(text="", tool_calls=[]))]
+
+    events = [e async for e in agent_loop.run_turn(session, "hello")]
+    assert [e for e in events if isinstance(e, agent_loop.Finished)]
+
+    assistant_turn = session.messages[-1]
+    assert assistant_turn["role"] == "assistant"
+    assert assistant_turn["content"] == ""  # well-formed — NOT None
+    assert "tool_calls" not in assistant_turn

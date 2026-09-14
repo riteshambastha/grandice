@@ -42,8 +42,24 @@ class Reply:
 
     @property
     def message(self) -> dict[str, Any]:
-        """The assistant turn as it goes back into the transcript."""
-        msg: dict[str, Any] = {"role": "assistant", "content": self.text or None}
+        """The assistant turn as it goes back into the transcript.
+
+        Real bug, found live: `content: None` is only a well-formed assistant
+        turn when `tool_calls` is also present (the standard "said nothing,
+        just called a tool" shape) — with no tool_calls too, it's a message
+        with neither content nor a tool call, which is degenerate. Sent back
+        to a self-hosted model (confirmed on Ollama-served qwen3:8b) as
+        conversation history, that degenerate turn silently breaks the chat
+        template: every completion for the REST of that session then comes
+        back empty in ~200ms, no matter what's asked next — the "just
+        rephrase or resend" advice below it (loop.py's empty-reply message)
+        can never actually recover the conversation. Falling back to `""`
+        instead of `None` when there's no tool_calls keeps every other case
+        byte-identical (a real reply, or a pure tool call) while making the
+        one genuinely-empty-reply case a normal, well-formed turn a model
+        can continue from.
+        """
+        msg: dict[str, Any] = {"role": "assistant", "content": self.text if (self.text or not self.tool_calls) else None}
         if self.tool_calls:
             msg["tool_calls"] = [
                 {
