@@ -256,3 +256,64 @@ async def test_empty_reply_does_not_poison_the_transcript_with_a_null_turn(sessi
     assert assistant_turn["role"] == "assistant"
     assert assistant_turn["content"] == ""  # well-formed — NOT None
     assert "tool_calls" not in assistant_turn
+
+
+# §05.8 — the OTHER retry-loop shape: a call that keeps SUCCEEDING with the
+# same arguments but never leads anywhere. Real bug, found live: asked to
+# visualize an uploaded CSV, the model cycled todo -> glob -> read (same
+# file, same limit) -> todo -> glob -> read... for the full 120-step budget
+# (~$0.46) without ever attempting to actually produce a chart. Nothing
+# there ever failed, so REFLECT_AFTER's failure-counting never fired.
+class _RepeatingCallStub(Backend):
+    """Yields the SAME tool call over and over, with one different call
+    (`todo`) interleaved every other step — matching the exact cyclic
+    shape of the real stuck loop, not just immediate back-to-back repeats."""
+
+    name = "stub-repeating"
+
+    def __init__(self, repeats: int) -> None:
+        self._repeats = repeats
+        self._n = 0
+
+    async def complete(self, model, messages, tools, temperature, max_tokens=None):
+        self._n += 1
+        if self._n > self._repeats:
+            yield Reply(text="Giving up — no new approach.")
+            return
+        if self._n % 2 == 1:
+            yield Reply(text="", tool_calls=[ToolCall(str(self._n), "glob", {"pattern": "**/*.csv"})])
+        else:
+            # Varies each time (unlike the glob above) so ITS repeat count
+            # never crosses the threshold first — this test is about the
+            # glob repeating, not the todo.
+            status = "in_progress" if self._n % 4 == 0 else "pending"
+            yield Reply(text="", tool_calls=[ToolCall(str(self._n), "todo", {"items": [{"task": "look", "status": status}]})])
+
+
+async def test_repeated_identical_successful_call_triggers_a_rethink(session):
+    session.router.backends = [_RepeatingCallStub(repeats=6)]
+
+    events = [e async for e in agent_loop.run_turn(session, "visualize this data")]
+    assert [e for e in events if isinstance(e, agent_loop.Finished)]
+
+    notes = [
+        m for m in session.messages
+        if m.get("role") == "user" and isinstance(m.get("content"), str) and "<system_note>" in m["content"]
+    ]
+    assert notes, "expected a repetition rethink to be injected into the transcript"
+    assert "glob" in notes[0]["content"]
+
+
+async def test_a_couple_of_repeats_do_not_yet_trigger_a_rethink(session):
+    """Must not misfire on ordinary, brief re-checking — only genuinely
+    excessive repetition (REPEAT_REFLECT_AFTER) should trigger this."""
+    session.router.backends = [_RepeatingCallStub(repeats=2)]
+
+    events = [e async for e in agent_loop.run_turn(session, "visualize this data")]
+    assert [e for e in events if isinstance(e, agent_loop.Finished)]
+
+    notes = [
+        m for m in session.messages
+        if m.get("role") == "user" and isinstance(m.get("content"), str) and "<system_note>" in m["content"]
+    ]
+    assert notes == []

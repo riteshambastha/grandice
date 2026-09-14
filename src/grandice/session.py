@@ -49,6 +49,13 @@ class Session:
     # tool name -> consecutive failures, for the reflection trigger (§05.8)
     failures: dict[str, int] = field(default_factory=dict)
 
+    # exact "tool:sorted-json-arguments" signature -> times seen, for the
+    # OTHER §05.8 reflection trigger: a call that keeps succeeding with the
+    # same arguments but never leads anywhere. Counted across the whole
+    # session, not just consecutively — the loop this caught cycled through
+    # 2-3 other calls in between each repeat of the same one.
+    repeats: dict[str, int] = field(default_factory=dict)
+
     @property
     def log_path(self) -> Path:
         path = self.config.workspace.parent / ".grandice" / f"{self.id}.jsonl"
@@ -70,6 +77,13 @@ class Session:
 
     def note_success(self, tool: str) -> None:
         self.failures.pop(tool, None)
+
+    def note_repeat(self, signature: str) -> int:
+        self.repeats[signature] = self.repeats.get(signature, 0) + 1
+        return self.repeats[signature]
+
+    def reset_repeat(self, signature: str) -> None:
+        self.repeats.pop(signature, None)
 
 
 def build(config: Config, gate: Gate) -> Session:

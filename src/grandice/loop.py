@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import difflib
+import json
 import mimetypes
 
 from collections.abc import AsyncIterator
@@ -23,6 +24,18 @@ from .session import Session
 from .tools.base import Risk, tool_error, tool_result, truncate, validate
 
 REFLECT_AFTER = 2  # consecutive failures on one tool before a forced rethink
+
+# A weaker model's OTHER stuck-loop shape (§05.8, distinct from repeated
+# failure above): the exact same tool call, byte-identical arguments,
+# SUCCEEDING every time but never followed by any different action —
+# confirmed live burning a full 120-step budget (~$0.46) on
+# todo -> glob -> read (same file, same limit) -> todo -> glob -> read...,
+# never once trying an approach that could actually produce the chart it
+# was asked for. Nothing here fails, so REFLECT_AFTER above never fires.
+# Counted per exact call signature across the whole session, not just
+# consecutively, since the loop cycled through 2-3 other calls in between
+# each repeat.
+REPEAT_REFLECT_AFTER = 3
 
 # Tools that change a file's contents on disk — the ones worth diffing.
 # Anything else (bash writing a file some other way, an MCP connector) isn't
@@ -166,6 +179,11 @@ async def run_turn(
                 session.log("reflection", tool=call.name)
             elif not failed:
                 session.note_success(call.name)
+                signature = f"{call.name}:{json.dumps(call.arguments, sort_keys=True)}"
+                if session.note_repeat(signature) >= REPEAT_REFLECT_AFTER:
+                    session.messages.append(_repetition_reflection(call.name, call.arguments))
+                    session.log("reflection", tool=call.name, reason="repetition")
+                    session.reset_repeat(signature)
 
         session.steps += 1
     else:
@@ -268,6 +286,25 @@ def _reflection(tool: str) -> dict[str, Any]:
             f"<system_note>\n`{tool}` has now failed twice in a row. Before calling it "
             f"again, state in one or two sentences why it failed and what you will do "
             f"differently. If you do not have a different approach, say so and stop.\n"
+            f"</system_note>"
+        ),
+    }
+
+
+def _repetition_reflection(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """The other half of §05.8's retry-loop guard: `tool` keeps SUCCEEDING
+    with these exact arguments, repeatedly, with nothing new coming of it —
+    REFLECT_AFTER above only catches failures, so this one exists to catch
+    a model that just re-runs the same successful no-op instead."""
+    return {
+        "role": "user",
+        "content": (
+            f"<system_note>\nYou have now called `{tool}` with these exact arguments "
+            f"({json.dumps(arguments, sort_keys=True)}) multiple times without it leading "
+            f"to any new action. Before calling it again, state in one or two sentences "
+            f"what new information you're expecting this time, or take a genuinely "
+            f"different next step (a different tool, a different file, or actually "
+            f"producing the output the task asked for).\n"
             f"</system_note>"
         ),
     }
